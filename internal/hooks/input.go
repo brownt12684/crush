@@ -20,25 +20,77 @@ const SupportedOutputVersion = 1
 // Claude Code hooks (which expect tool_input to be an object, not a
 // string).
 type Payload struct {
-	Event     string          `json:"event"`
-	SessionID string          `json:"session_id"`
-	CWD       string          `json:"cwd"`
-	ToolName  string          `json:"tool_name"`
-	ToolInput json.RawMessage `json:"tool_input"`
+	Event             string          `json:"event"`
+	SessionID         string          `json:"session_id"`
+	CWD               string          `json:"cwd"`
+	ToolName          string          `json:"tool_name,omitempty"`
+	ToolInput         json.RawMessage `json:"tool_input,omitempty"`
+	Prompt            string          `json:"prompt,omitempty"`
+	AssistantResponse string          `json:"assistant_response,omitempty"`
+	FinishReason      string          `json:"finish_reason,omitempty"`
+	Model             string          `json:"model,omitempty"`
+	Provider          string          `json:"provider,omitempty"`
+	Error             string          `json:"error,omitempty"`
+	DurationMS        int64           `json:"duration_ms,omitempty"`
+	NonInteractive    bool            `json:"non_interactive,omitempty"`
+	ToolCalls         []string        `json:"tool_calls,omitempty"`
+	Metadata          json.RawMessage `json:"metadata,omitempty"`
+}
+
+// EventInput carries hook event metadata for both tool and lifecycle events.
+type EventInput struct {
+	SessionID         string
+	ToolName          string
+	ToolInputJSON     string
+	Prompt            string
+	AssistantResponse string
+	FinishReason      string
+	Model             string
+	Provider          string
+	Error             string
+	MetadataJSON      string
+	DurationMS        int64
+	NonInteractive    bool
+	ToolCalls         []string
 }
 
 // BuildPayload constructs the JSON stdin payload for a hook command.
 func BuildPayload(eventName, sessionID, cwd, toolName, toolInputJSON string) []byte {
-	toolInput := json.RawMessage(toolInputJSON)
-	if !json.Valid(toolInput) {
-		toolInput = json.RawMessage("{}")
+	return BuildPayloadFromInput(eventName, cwd, EventInput{
+		SessionID:     sessionID,
+		ToolName:      toolName,
+		ToolInputJSON: toolInputJSON,
+	})
+}
+
+// BuildPayloadFromInput constructs the JSON stdin payload for a hook command.
+func BuildPayloadFromInput(eventName, cwd string, input EventInput) []byte {
+	var toolInput json.RawMessage
+	if json.Valid([]byte(input.ToolInputJSON)) {
+		toolInput = json.RawMessage(input.ToolInputJSON)
 	}
+
+	var metadata json.RawMessage
+	if json.Valid([]byte(input.MetadataJSON)) {
+		metadata = json.RawMessage(input.MetadataJSON)
+	}
+
 	p := Payload{
-		Event:     eventName,
-		SessionID: sessionID,
-		CWD:       cwd,
-		ToolName:  toolName,
-		ToolInput: toolInput,
+		Event:             eventName,
+		SessionID:         input.SessionID,
+		CWD:               cwd,
+		ToolName:          input.ToolName,
+		ToolInput:         toolInput,
+		Prompt:            input.Prompt,
+		AssistantResponse: input.AssistantResponse,
+		FinishReason:      input.FinishReason,
+		Model:             input.Model,
+		Provider:          input.Provider,
+		Error:             input.Error,
+		DurationMS:        input.DurationMS,
+		NonInteractive:    input.NonInteractive,
+		ToolCalls:         input.ToolCalls,
+		Metadata:          metadata,
 	}
 	data, err := json.Marshal(p)
 	if err != nil {
@@ -50,21 +102,62 @@ func BuildPayload(eventName, sessionID, cwd, toolName, toolInputJSON string) []b
 // BuildEnv constructs the environment variable slice for a hook command.
 // It includes all current process env vars plus hook-specific ones.
 func BuildEnv(eventName, toolName, sessionID, cwd, projectDir, toolInputJSON string) []string {
+	return BuildEnvFromInput(eventName, cwd, projectDir, EventInput{
+		SessionID:     sessionID,
+		ToolName:      toolName,
+		ToolInputJSON: toolInputJSON,
+	})
+}
+
+// BuildEnvFromInput constructs the environment variable slice for a hook command.
+func BuildEnvFromInput(eventName, cwd, projectDir string, input EventInput) []string {
 	env := os.Environ()
+	payloadJSON := string(BuildPayloadFromInput(eventName, cwd, input))
 	env = append(env,
 		fmt.Sprintf("CRUSH_EVENT=%s", eventName),
-		fmt.Sprintf("CRUSH_TOOL_NAME=%s", toolName),
-		fmt.Sprintf("CRUSH_SESSION_ID=%s", sessionID),
+		fmt.Sprintf("CRUSH_TOOL_NAME=%s", input.ToolName),
+		fmt.Sprintf("CRUSH_SESSION_ID=%s", input.SessionID),
 		fmt.Sprintf("CRUSH_CWD=%s", cwd),
 		fmt.Sprintf("CRUSH_PROJECT_DIR=%s", projectDir),
+		fmt.Sprintf("CRUSH_HOOK_PAYLOAD=%s", payloadJSON),
 	)
+	if input.Prompt != "" {
+		env = append(env, fmt.Sprintf("CRUSH_PROMPT=%s", input.Prompt))
+	}
+	if input.AssistantResponse != "" {
+		env = append(env, fmt.Sprintf("CRUSH_ASSISTANT_RESPONSE=%s", input.AssistantResponse))
+	}
+	if input.FinishReason != "" {
+		env = append(env, fmt.Sprintf("CRUSH_FINISH_REASON=%s", input.FinishReason))
+	}
+	if input.Model != "" {
+		env = append(env, fmt.Sprintf("CRUSH_MODEL=%s", input.Model))
+	}
+	if input.Provider != "" {
+		env = append(env, fmt.Sprintf("CRUSH_PROVIDER=%s", input.Provider))
+	}
+	if input.Error != "" {
+		env = append(env, fmt.Sprintf("CRUSH_ERROR=%s", input.Error))
+	}
+	if input.DurationMS > 0 {
+		env = append(env, fmt.Sprintf("CRUSH_DURATION_MS=%d", input.DurationMS))
+	}
+	if input.NonInteractive {
+		env = append(env, "CRUSH_NON_INTERACTIVE=1")
+	}
+	if len(input.ToolCalls) > 0 {
+		env = append(env, fmt.Sprintf("CRUSH_TOOL_CALLS=%s", strings.Join(input.ToolCalls, ",")))
+	}
+	if input.MetadataJSON != "" {
+		env = append(env, fmt.Sprintf("CRUSH_METADATA=%s", input.MetadataJSON))
+	}
 
 	// Extract tool-specific env vars from the JSON input.
-	if toolInputJSON != "" {
-		if cmd := gjson.Get(toolInputJSON, "command"); cmd.Exists() {
+	if input.ToolInputJSON != "" {
+		if cmd := gjson.Get(input.ToolInputJSON, "command"); cmd.Exists() {
 			env = append(env, fmt.Sprintf("CRUSH_TOOL_INPUT_COMMAND=%s", cmd.String()))
 		}
-		if fp := gjson.Get(toolInputJSON, "file_path"); fp.Exists() {
+		if fp := gjson.Get(input.ToolInputJSON, "file_path"); fp.Exists() {
 			env = append(env, fmt.Sprintf("CRUSH_TOOL_INPUT_FILE_PATH=%s", fp.String()))
 		}
 	}

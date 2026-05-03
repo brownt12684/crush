@@ -38,6 +38,7 @@ import (
 	"github.com/charmbracelet/crush/internal/agent/tools/mcp"
 	"github.com/charmbracelet/crush/internal/config"
 	"github.com/charmbracelet/crush/internal/csync"
+	"github.com/charmbracelet/crush/internal/hooks"
 	"github.com/charmbracelet/crush/internal/message"
 	"github.com/charmbracelet/crush/internal/pubsub"
 	"github.com/charmbracelet/crush/internal/session"
@@ -57,6 +58,8 @@ const (
 
 var userAgent = fmt.Sprintf("Charm-Crush/%s (https://charm.land/crush)", version.Version)
 
+const interruptedSessionPromptPrefix = "The previous session was interrupted because it got too long, the initial user request was: `"
+
 //go:embed templates/title.md
 var titlePrompt []byte
 
@@ -72,6 +75,7 @@ var (
 type SessionAgentCall struct {
 	SessionID        string
 	Prompt           string
+	TurnSystemAppend string
 	ProviderOptions  fantasy.ProviderOptions
 	Attachments      []message.Attachment
 	MaxOutputTokens  int64
@@ -81,6 +85,24 @@ type SessionAgentCall struct {
 	FrequencyPenalty *float64
 	PresencePenalty  *float64
 	NonInteractive   bool
+}
+
+func unwrapInterruptedSessionPrompt(prompt string) string {
+	unwrapped := strings.TrimSpace(prompt)
+	for strings.HasPrefix(unwrapped, interruptedSessionPromptPrefix) && strings.HasSuffix(unwrapped, "`") {
+		inner := strings.TrimSuffix(strings.TrimPrefix(unwrapped, interruptedSessionPromptPrefix), "`")
+		inner = strings.TrimSpace(inner)
+		if inner == "" || inner == unwrapped {
+			break
+		}
+		unwrapped = inner
+	}
+	return unwrapped
+}
+
+func wrapInterruptedSessionPrompt(prompt string) string {
+	clean := unwrapInterruptedSessionPrompt(prompt)
+	return interruptedSessionPromptPrefix + clean + "`"
 }
 
 type SessionAgent interface {
@@ -111,6 +133,8 @@ type sessionAgent struct {
 	systemPromptPrefix *csync.Value[string]
 	systemPrompt       *csync.Value[string]
 	tools              *csync.Slice[fantasy.AgentTool]
+	preTurnHooks       *hooks.Runner
+	postTurnHooks      *hooks.Runner
 
 	isSubAgent           bool
 	sessions             session.Service
@@ -128,6 +152,8 @@ type SessionAgentOptions struct {
 	SmallModel           Model
 	SystemPromptPrefix   string
 	SystemPrompt         string
+	PreTurnHooks         *hooks.Runner
+	PostTurnHooks        *hooks.Runner
 	IsSubAgent           bool
 	DisableAutoSummarize bool
 	IsYolo               bool
@@ -145,6 +171,8 @@ func NewSessionAgent(
 		smallModel:           csync.NewValue(opts.SmallModel),
 		systemPromptPrefix:   csync.NewValue(opts.SystemPromptPrefix),
 		systemPrompt:         csync.NewValue(opts.SystemPrompt),
+		preTurnHooks:         opts.PreTurnHooks,
+		postTurnHooks:        opts.PostTurnHooks,
 		isSubAgent:           opts.IsSubAgent,
 		sessions:             opts.Sessions,
 		messages:             opts.Messages,
@@ -230,6 +258,14 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 	}
 	defer wg.Wait()
 
+	a.runLifecycleHook(ctx, a.preTurnHooks, hooks.EventPreTurn, hooks.EventInput{
+		SessionID:      call.SessionID,
+		Prompt:         message.PromptWithTextAttachments(call.Prompt, call.Attachments),
+		Model:          largeModel.ModelCfg.Model,
+		Provider:       largeModel.ModelCfg.Provider,
+		NonInteractive: call.NonInteractive,
+	})
+
 	// Add the user message to the session.
 	_, err = a.createUserMessage(ctx, call)
 	if err != nil {
@@ -307,6 +343,9 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 
 			if promptPrefix != "" {
 				prepared.Messages = append([]fantasy.Message{fantasy.NewSystemMessage(promptPrefix)}, prepared.Messages...)
+			}
+			if call.TurnSystemAppend != "" {
+				prepared.Messages = append([]fantasy.Message{fantasy.NewSystemMessage(call.TurnSystemAppend)}, prepared.Messages...)
 			}
 
 			var assistantMsg message.Message
@@ -577,6 +616,18 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 		if updateErr != nil {
 			return nil, updateErr
 		}
+		a.runLifecycleHook(ctx, a.postTurnHooks, hooks.EventPostTurn, hooks.EventInput{
+			SessionID:         call.SessionID,
+			Prompt:            message.PromptWithTextAttachments(call.Prompt, call.Attachments),
+			AssistantResponse: currentAssistant.Content().Text,
+			FinishReason:      string(currentAssistant.FinishReason()),
+			Model:             largeModel.ModelCfg.Model,
+			Provider:          largeModel.ModelCfg.Provider,
+			Error:             err.Error(),
+			DurationMS:        time.Since(startTime).Milliseconds(),
+			NonInteractive:    call.NonInteractive,
+			ToolCalls:         toolCallNames(currentAssistant),
+		})
 		return nil, err
 	}
 
@@ -601,10 +652,24 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 			if !ok {
 				existing = []SessionAgentCall{}
 			}
-			call.Prompt = fmt.Sprintf("The previous session was interrupted because it got too long, the initial user request was: `%s`", call.Prompt)
+			call.Prompt = wrapInterruptedSessionPrompt(call.Prompt)
 			existing = append(existing, call)
 			a.messageQueue.Set(call.SessionID, existing)
 		}
+	}
+
+	if currentAssistant != nil {
+		a.runLifecycleHook(ctx, a.postTurnHooks, hooks.EventPostTurn, hooks.EventInput{
+			SessionID:         call.SessionID,
+			Prompt:            message.PromptWithTextAttachments(call.Prompt, call.Attachments),
+			AssistantResponse: currentAssistant.Content().Text,
+			FinishReason:      string(currentAssistant.FinishReason()),
+			Model:             largeModel.ModelCfg.Model,
+			Provider:          largeModel.ModelCfg.Provider,
+			DurationMS:        time.Since(startTime).Milliseconds(),
+			NonInteractive:    call.NonInteractive,
+			ToolCalls:         toolCallNames(currentAssistant),
+		})
 	}
 
 	// Release active request before processing queued messages.
@@ -619,6 +684,45 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 	firstQueuedMessage := queuedMessages[0]
 	a.messageQueue.Set(call.SessionID, queuedMessages[1:])
 	return a.Run(ctx, firstQueuedMessage)
+}
+
+func (a *sessionAgent) runLifecycleHook(ctx context.Context, runner *hooks.Runner, eventName string, input hooks.EventInput) {
+	if runner == nil {
+		return
+	}
+	result, err := runner.RunEvent(ctx, eventName, input)
+	if err != nil {
+		slog.Warn("Lifecycle hook execution error", "event", eventName, "error", err)
+		return
+	}
+	if result.Decision != hooks.DecisionNone || result.Halt || result.Reason != "" {
+		slog.Debug("Lifecycle hook completed with decision",
+			"event", eventName,
+			"decision", result.Decision.String(),
+			"halt", result.Halt,
+			"reason", result.Reason,
+		)
+	}
+}
+
+func toolCallNames(msg *message.Message) []string {
+	if msg == nil {
+		return nil
+	}
+	calls := msg.ToolCalls()
+	if len(calls) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(calls))
+	seen := make(map[string]struct{}, len(calls))
+	for _, call := range calls {
+		if _, ok := seen[call.Name]; ok {
+			continue
+		}
+		seen[call.Name] = struct{}{}
+		names = append(names, call.Name)
+	}
+	return names
 }
 
 func (a *sessionAgent) Summarize(ctx context.Context, sessionID string, opts fantasy.ProviderOptions) error {
@@ -1313,7 +1417,9 @@ func (a *sessionAgent) workaroundProviderMediaLimitations(messages []fantasy.Mes
 // buildSummaryPrompt constructs the prompt text for session summarization.
 func buildSummaryPrompt(todos []session.Todo) string {
 	var sb strings.Builder
-	sb.WriteString("Provide a detailed summary of our conversation above.")
+	sb.WriteString("Provide a concise operational handoff summary of our conversation above.")
+	sb.WriteString(" Focus on current state, validated findings, changed files, blockers, and next steps.")
+	sb.WriteString(" Avoid repeating large directory listings, long transcripts, or duplicate context.")
 	if len(todos) > 0 {
 		sb.WriteString("\n\n## Current Todo List\n\n")
 		for _, t := range todos {

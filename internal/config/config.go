@@ -414,7 +414,7 @@ type Config struct {
 
 	Tools Tools `json:"tools,omitzero" jsonschema:"description=Tool configurations"`
 
-	Hooks map[string][]HookConfig `json:"hooks,omitempty" jsonschema:"description=User-defined shell commands that fire on hook events (e.g. PreToolUse)"`
+	Hooks map[string][]HookConfig `json:"hooks,omitempty" jsonschema:"description=User-defined shell commands that fire on hook events (e.g. PreToolUse, PreTurn, PostTurn)"`
 
 	Agents map[string]Agent `json:"-"`
 }
@@ -502,6 +502,7 @@ func allToolNames() []string {
 		"grep",
 		"ls",
 		"sourcegraph",
+		"todo",
 		"todos",
 		"view",
 		"write",

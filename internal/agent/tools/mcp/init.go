@@ -216,6 +216,7 @@ func WaitForInit(ctx context.Context) error {
 
 // InitializeSingle initializes a single MCP client by name.
 func InitializeSingle(ctx context.Context, name string, cfg *config.ConfigStore) error {
+	name = normalizeMCPName(name)
 	m, exists := cfg.Config().MCP[name]
 	if !exists {
 		return fmt.Errorf("mcp '%s' not found in configuration", name)
@@ -271,6 +272,7 @@ func initClient(ctx context.Context, cfg *config.ConfigStore, name string, m con
 
 // DisableSingle disables and closes a single MCP client by name.
 func DisableSingle(cfg *config.ConfigStore, name string) error {
+	name = normalizeMCPName(name)
 	session, ok := sessions.Get(name)
 	if ok {
 		if err := session.Close(); err != nil &&
@@ -294,6 +296,7 @@ func DisableSingle(cfg *config.ConfigStore, name string) error {
 }
 
 func getOrRenewClient(ctx context.Context, cfg *config.ConfigStore, name string) (*ClientSession, error) {
+	name = normalizeMCPName(name)
 	sess, ok := sessions.Get(name)
 	if !ok {
 		return nil, fmt.Errorf("mcp '%s' not available", name)
@@ -435,6 +438,26 @@ func maybeTimeoutErr(err error, timeout time.Duration) error {
 		return fmt.Errorf("timed out after %s", timeout)
 	}
 	return err
+}
+
+func normalizeMCPName(name string) string {
+	trimmed := strings.TrimSpace(name)
+	if trimmed == "" {
+		return trimmed
+	}
+
+	normalized := strings.ToLower(trimmed)
+	normalized = strings.ReplaceAll(normalized, "_", "-")
+	normalized = strings.ReplaceAll(normalized, " ", "-")
+
+	switch normalized {
+	case "stack-orchestrator", "stack/orchestrator", "stack-orchestrator-memory", "stack/orchestrator/memory", "orchestrator", "orchestrator-memory", "orchestrator/memory", "memory-orchestrator", "memory/orchestrator":
+		return "stack-orchestrator"
+	case "docker", "docker-mcp", "docker/mcp":
+		return "docker-mcp"
+	default:
+		return trimmed
+	}
 }
 
 func createTransport(ctx context.Context, m config.MCPConfig, resolver config.VariableResolver) (mcp.Transport, error) {

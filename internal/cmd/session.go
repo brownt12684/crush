@@ -21,6 +21,7 @@ import (
 	"github.com/charmbracelet/crush/internal/db"
 	"github.com/charmbracelet/crush/internal/event"
 	"github.com/charmbracelet/crush/internal/message"
+	"github.com/charmbracelet/crush/internal/orchestrator"
 	"github.com/charmbracelet/crush/internal/session"
 	"github.com/charmbracelet/crush/internal/ui/chat"
 	"github.com/charmbracelet/crush/internal/ui/styles"
@@ -280,7 +281,7 @@ func runSessionShow(cmd *cobra.Command, args []string) error {
 
 	msgPtrs := messagePtrs(msgs)
 	if sessionShowJSON {
-		return outputSessionJSON(cmd.OutOrStdout(), sess, msgPtrs)
+		return outputSessionJSON(ctx, cmd.OutOrStdout(), sess, msgPtrs)
 	}
 	return outputSessionHuman(ctx, svc.cfg, sess, msgPtrs)
 }
@@ -387,7 +388,7 @@ func runSessionLast(cmd *cobra.Command, _ []string) error {
 
 	msgPtrs := messagePtrs(msgs)
 	if sessionLastJSON {
-		return outputSessionJSON(cmd.OutOrStdout(), sess, msgPtrs)
+		return outputSessionJSON(ctx, cmd.OutOrStdout(), sess, msgPtrs)
 	}
 	return outputSessionHuman(ctx, svc.cfg, sess, msgPtrs)
 }
@@ -405,21 +406,10 @@ func messagePtrs(msgs []message.Message) []*message.Message {
 	return ptrs
 }
 
-func outputSessionJSON(w io.Writer, sess session.Session, msgs []*message.Message) error {
-	skills := extractSkillsFromMessages(msgs)
+func outputSessionJSON(ctx context.Context, w io.Writer, sess session.Session, msgs []*message.Message) error {
+	meta := buildSessionShowMeta(ctx, sess, msgs)
 	output := sessionShowOutput{
-		Meta: sessionShowMeta{
-			ID:               session.HashID(sess.ID),
-			UUID:             sess.ID,
-			Title:            sess.Title,
-			Created:          time.Unix(sess.CreatedAt, 0).Format(time.RFC3339),
-			Modified:         time.Unix(sess.UpdatedAt, 0).Format(time.RFC3339),
-			Cost:             sess.Cost,
-			PromptTokens:     sess.PromptTokens,
-			CompletionTokens: sess.CompletionTokens,
-			TotalTokens:      sess.PromptTokens + sess.CompletionTokens,
-			Skills:           skills,
-		},
+		Meta:     meta,
 		Messages: make([]sessionShowMessage, len(msgs)),
 	}
 
@@ -456,30 +446,48 @@ func outputSessionHuman(ctx context.Context, cfg *config.ConfigStore, sess sessi
 	keyStyle := lipgloss.NewStyle().Foreground(charmtone.Damson)
 	valStyle := lipgloss.NewStyle().Foreground(charmtone.Malibu)
 
-	hash := session.HashID(sess.ID)[:12]
-	created := time.Unix(sess.CreatedAt, 0).Format("Mon Jan 2 15:04:05 2006 -0700")
-
-	skills := extractSkillsFromMessages(msgs)
+	meta := buildSessionShowMeta(ctx, sess, msgs)
 
 	// Render to buffer to determine actual height
 	var buf strings.Builder
 
-	fmt.Fprintln(&buf, keyStyle.Render("ID:    ")+valStyle.Render(hash))
-	fmt.Fprintln(&buf, keyStyle.Render("UUID:  ")+valStyle.Render(sess.ID))
-	fmt.Fprintln(&buf, keyStyle.Render("Title: ")+valStyle.Render(sess.Title))
-	fmt.Fprintln(&buf, keyStyle.Render("Date:  ")+valStyle.Render(created))
-	if len(skills) > 0 {
-		skillNames := make([]string, len(skills))
-		for i, s := range skills {
-			timestamp := time.Unix(sess.CreatedAt, 0).Format("15:04:05 -0700")
+	fmt.Fprintln(&buf, keyStyle.Render("ID:    ")+valStyle.Render(shortSessionID(meta.ID)))
+	fmt.Fprintln(&buf, keyStyle.Render("UUID:  ")+valStyle.Render(meta.UUID))
+	fmt.Fprintln(&buf, keyStyle.Render("Title: ")+valStyle.Render(meta.Title))
+	fmt.Fprintln(&buf, keyStyle.Render("Date:  ")+valStyle.Render(humanTimestamp(meta.Created)))
+	if len(meta.Skills) > 0 {
+		skillNames := make([]string, len(meta.Skills))
+		for i, s := range meta.Skills {
+			timestamp := humanClock(meta.Created)
 			if s.LoadedAt != "" {
-				if t, err := time.Parse(time.RFC3339, s.LoadedAt); err == nil {
-					timestamp = t.Format("15:04:05 -0700")
-				}
+				timestamp = humanClock(s.LoadedAt)
 			}
 			skillNames[i] = fmt.Sprintf("%s (%s)", s.Name, timestamp)
 		}
 		fmt.Fprintln(&buf, keyStyle.Render("Skills: ")+valStyle.Render(strings.Join(skillNames, ", ")))
+	}
+	if meta.Orchestrator != nil {
+		if decision := meta.Orchestrator.LastDecision; decision != nil {
+			route := strings.TrimSpace(decision.Route)
+			if route == "" {
+				route = "unknown"
+			}
+			model := strings.TrimSpace(decision.SelectedModel)
+			if model == "" {
+				model = "unknown"
+			}
+			fmt.Fprintln(&buf, keyStyle.Render("Route: ")+valStyle.Render(route))
+			fmt.Fprintln(&buf, keyStyle.Render("Model: ")+valStyle.Render(model))
+		}
+		if throughput := meta.Orchestrator.LastThroughput; throughput != nil {
+			fmt.Fprintln(&buf, keyStyle.Render("Turn:  ")+valStyle.Render(formatThroughputHuman(*throughput)))
+		}
+		if len(meta.Orchestrator.RecentCheckpoints) > 0 {
+			fmt.Fprintln(&buf, keyStyle.Render("Check: ")+valStyle.Render(formatCheckpointHuman(meta.Orchestrator.RecentCheckpoints[0])))
+		}
+		if meta.Orchestrator.Warning != "" {
+			fmt.Fprintln(&buf, keyStyle.Render("Orch:  ")+valStyle.Render("warning: "+meta.Orchestrator.Warning))
+		}
 	}
 	fmt.Fprintln(&buf)
 
@@ -569,16 +577,26 @@ func sessionWriter(ctx context.Context, contentHeight int) (io.Writer, func(), b
 }
 
 type sessionShowMeta struct {
-	ID               string             `json:"id"`
-	UUID             string             `json:"uuid"`
-	Title            string             `json:"title"`
-	Created          string             `json:"created"`
-	Modified         string             `json:"modified"`
-	Cost             float64            `json:"cost"`
-	PromptTokens     int64              `json:"prompt_tokens"`
-	CompletionTokens int64              `json:"completion_tokens"`
-	TotalTokens      int64              `json:"total_tokens"`
-	Skills           []sessionShowSkill `json:"skills,omitempty"`
+	ID               string                   `json:"id"`
+	UUID             string                   `json:"uuid"`
+	Title            string                   `json:"title"`
+	Created          string                   `json:"created"`
+	Modified         string                   `json:"modified"`
+	Cost             float64                  `json:"cost"`
+	PromptTokens     int64                    `json:"prompt_tokens"`
+	CompletionTokens int64                    `json:"completion_tokens"`
+	TotalTokens      int64                    `json:"total_tokens"`
+	Skills           []sessionShowSkill       `json:"skills,omitempty"`
+	Orchestrator     *sessionShowOrchestrator `json:"orchestrator,omitempty"`
+}
+
+type sessionShowOrchestrator struct {
+	Source            string                               `json:"source,omitempty"`
+	DBPath            string                               `json:"db_path,omitempty"`
+	Warning           string                               `json:"warning,omitempty"`
+	LastDecision      *orchestrator.DecisionObservation    `json:"last_decision,omitempty"`
+	LastThroughput    *orchestrator.ThroughputObservation  `json:"last_throughput,omitempty"`
+	RecentCheckpoints []orchestrator.CheckpointObservation `json:"recent_checkpoints,omitempty"`
 }
 
 type sessionShowSkill struct {
@@ -661,6 +679,103 @@ func extractSkillsFromMessages(msgs []*message.Message) []sessionShowSkill {
 	})
 
 	return skills
+}
+
+func buildSessionShowMeta(ctx context.Context, sess session.Session, msgs []*message.Message) sessionShowMeta {
+	meta := sessionShowMeta{
+		ID:               session.HashID(sess.ID),
+		UUID:             sess.ID,
+		Title:            sess.Title,
+		Created:          time.Unix(sess.CreatedAt, 0).Format(time.RFC3339),
+		Modified:         time.Unix(sess.UpdatedAt, 0).Format(time.RFC3339),
+		Cost:             sess.Cost,
+		PromptTokens:     sess.PromptTokens,
+		CompletionTokens: sess.CompletionTokens,
+		TotalTokens:      sess.PromptTokens + sess.CompletionTokens,
+		Skills:           extractSkillsFromMessages(msgs),
+	}
+
+	obs, err := orchestrator.LoadSessionObservability(ctx, sess.ID)
+	if err != nil {
+		meta.Orchestrator = &sessionShowOrchestrator{
+			DBPath:  orchestrator.MemoryDBPathFromEnv(),
+			Source:  orchestrator.SourceFromEnv(),
+			Warning: err.Error(),
+		}
+		return meta
+	}
+	if obs != nil {
+		meta.Orchestrator = &sessionShowOrchestrator{
+			Source:            obs.Source,
+			DBPath:            obs.DBPath,
+			LastDecision:      obs.LastDecision,
+			LastThroughput:    obs.LastThroughput,
+			RecentCheckpoints: obs.RecentCheckpoints,
+		}
+	}
+
+	return meta
+}
+
+func shortSessionID(id string) string {
+	if len(id) <= 12 {
+		return id
+	}
+	return id[:12]
+}
+
+func humanTimestamp(rfc3339 string) string {
+	t, err := time.Parse(time.RFC3339, rfc3339)
+	if err != nil {
+		return rfc3339
+	}
+	return t.Format("Mon Jan 2 15:04:05 2006 -0700")
+}
+
+func humanClock(rfc3339 string) string {
+	t, err := time.Parse(time.RFC3339, rfc3339)
+	if err != nil {
+		return rfc3339
+	}
+	return t.Format("15:04:05 -0700")
+}
+
+func formatThroughputHuman(item orchestrator.ThroughputObservation) string {
+	state := "failed"
+	if item.Success {
+		state = "ok"
+	}
+	return fmt.Sprintf(
+		"%s %d tok %.2fs %.1f tok/s (%s)",
+		item.Phase,
+		item.TotalTokens,
+		item.ElapsedSeconds,
+		item.TokensPerSecond,
+		state,
+	)
+}
+
+func formatCheckpointHuman(item orchestrator.CheckpointObservation) string {
+	var details []string
+	details = append(details, item.Phase)
+	if item.CreatedAt != "" {
+		details = append(details, item.CreatedAt)
+	}
+	switch {
+	case item.Summary != "":
+		details = append(details, truncateSingleLine(item.Summary, 80))
+	case item.Task != "":
+		details = append(details, truncateSingleLine(item.Task, 80))
+	}
+	return strings.Join(details, " | ")
+}
+
+func truncateSingleLine(s string, maxWidth int) string {
+	s = strings.Join(strings.Fields(strings.TrimSpace(s)), " ")
+	if s == "" || maxWidth <= 0 {
+		return s
+	}
+	return ansi.Truncate(s, maxWidth, "...")
 }
 
 func convertParts(parts []message.ContentPart) []sessionShowPart {

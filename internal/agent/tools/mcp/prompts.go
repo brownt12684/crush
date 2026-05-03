@@ -21,6 +21,7 @@ func Prompts() iter.Seq2[string, []*Prompt] {
 
 // GetPromptMessages retrieves the content of an MCP prompt with the given arguments.
 func GetPromptMessages(ctx context.Context, cfg *config.ConfigStore, clientName, promptName string, args map[string]string) ([]string, error) {
+	clientName = normalizeMCPName(clientName)
 	c, err := getOrRenewClient(ctx, cfg, clientName)
 	if err != nil {
 		return nil, err

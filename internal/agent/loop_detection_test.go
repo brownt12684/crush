@@ -36,6 +36,35 @@ func makeToolStep(name, input, output string) fantasy.StepResult {
 	)
 }
 
+// makeToolErrorStep creates a step with a single tool call and matching error result.
+func makeToolErrorStep(name, input, errText string) fantasy.StepResult {
+	callID := fmt.Sprintf("call_%s_%s", name, input)
+	return makeStep(
+		[]fantasy.ToolCallContent{
+			{ToolCallID: callID, ToolName: name, Input: input},
+		},
+		[]fantasy.ToolResultContent{
+			{ToolCallID: callID, ToolName: name, Result: fantasy.ToolResultOutputContentError{Error: fmt.Errorf("%s", errText)}},
+		},
+	)
+}
+
+// makeRepeatedToolErrorStep creates a single step with multiple identical failing tool calls.
+func makeRepeatedToolErrorStep(name, input, errText string, repeats int) fantasy.StepResult {
+	calls := make([]fantasy.ToolCallContent, 0, repeats)
+	results := make([]fantasy.ToolResultContent, 0, repeats)
+	for i := range repeats {
+		callID := fmt.Sprintf("call_%s_%s_%d", name, input, i)
+		calls = append(calls, fantasy.ToolCallContent{ToolCallID: callID, ToolName: name, Input: input})
+		results = append(results, fantasy.ToolResultContent{
+			ToolCallID: callID,
+			ToolName:   name,
+			Result:     fantasy.ToolResultOutputContentError{Error: fmt.Errorf("%s", errText)},
+		})
+	}
+	return makeStep(calls, results)
+}
+
 // makeEmptyStep creates a step with no tool calls (e.g. a text-only response).
 func makeEmptyStep() fantasy.StepResult {
 	return fantasy.StepResult{
@@ -138,6 +167,30 @@ func TestHasRepeatedToolCalls(t *testing.T) {
 		result := hasRepeatedToolCalls(steps, 10, 5)
 		if result {
 			t.Error("expected false: two patterns each appearing 5 times (not > 5)")
+		}
+	})
+
+	t.Run("repeated failed identical tool calls trip early", func(t *testing.T) {
+		steps := []fantasy.StepResult{
+			makeRepeatedToolErrorStep("read_mcp_resource", `{"mcp_name":"docker-mcp","uri":"x"}`, "resource not found", 3),
+		}
+		result := hasRepeatedToolCalls(steps, 10, 5)
+		if !result {
+			t.Error("expected true when identical failed tool calls repeat within a single step")
+		}
+	})
+
+	t.Run("two failed repeats are allowed but three are not", func(t *testing.T) {
+		steps := []fantasy.StepResult{
+			makeToolErrorStep("read_mcp_resource", `{"mcp_name":"docker-mcp","uri":"x"}`, "resource not found"),
+			makeToolErrorStep("read_mcp_resource", `{"mcp_name":"docker-mcp","uri":"x"}`, "resource not found"),
+		}
+		if hasRepeatedToolCalls(steps, 10, 5) {
+			t.Error("expected false when failed identical tool call count equals threshold")
+		}
+		steps = append(steps, makeToolErrorStep("read_mcp_resource", `{"mcp_name":"docker-mcp","uri":"x"}`, "resource not found"))
+		if !hasRepeatedToolCalls(steps, 10, 5) {
+			t.Error("expected true when failed identical tool call count exceeds threshold")
 		}
 	})
 }

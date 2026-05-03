@@ -13,6 +13,7 @@ import (
 var todosDescription []byte
 
 const TodosToolName = "todos"
+const TodoToolAliasName = "todo"
 
 type TodosParams struct {
 	Todos []TodoItem `json:"todos" description:"The updated todo list"`
@@ -33,9 +34,9 @@ type TodosResponseMetadata struct {
 	Total         int            `json:"total"`
 }
 
-func NewTodosTool(sessions session.Service) fantasy.AgentTool {
+func newTodosToolWithName(name string, sessions session.Service) fantasy.AgentTool {
 	return fantasy.NewAgentTool(
-		TodosToolName,
+		name,
 		FirstLineDescription(todosDescription),
 		func(ctx context.Context, params TodosParams, call fantasy.ToolCall) (fantasy.ToolResponse, error) {
 			sessionID := GetSessionFromContext(ctx)
@@ -131,4 +132,12 @@ func NewTodosTool(sessions session.Service) fantasy.AgentTool {
 
 			return fantasy.WithResponseMetadata(fantasy.NewTextResponse(response), metadata), nil
 		})
+}
+
+func NewTodosTool(sessions session.Service) fantasy.AgentTool {
+	return newTodosToolWithName(TodosToolName, sessions)
+}
+
+func NewTodoAliasTool(sessions session.Service) fantasy.AgentTool {
+	return newTodosToolWithName(TodoToolAliasName, sessions)
 }

@@ -825,3 +825,16 @@ func TestProviderRetryLogFields(t *testing.T) {
 		}, fields)
 	})
 }
+
+func TestWrapInterruptedSessionPrompt(t *testing.T) {
+	original := "survey C:/projects one repo at a time"
+	wrapped := wrapInterruptedSessionPrompt(original)
+	require.Equal(t, interruptedSessionPromptPrefix+original+"`", wrapped)
+
+	rewrapped := wrapInterruptedSessionPrompt(wrapped)
+	require.Equal(t, wrapped, rewrapped)
+
+	nested := wrapInterruptedSessionPrompt(rewrapped)
+	require.Equal(t, wrapped, nested)
+	require.Equal(t, original, unwrapInterruptedSessionPrompt(nested))
+}

@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os/exec"
 	"regexp"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -18,6 +19,12 @@ import (
 type compiledHook struct {
 	cfg     config.HookConfig
 	matcher *regexp.Regexp
+}
+
+type shellSpec struct {
+	name     string
+	args     []string
+	useStdin bool
 }
 
 // Runner executes hook commands and aggregates their results.
@@ -75,7 +82,17 @@ func (r *Runner) Hooks() []config.HookConfig {
 // Run executes all matching hooks for the given event and tool, returning
 // an aggregated result.
 func (r *Runner) Run(ctx context.Context, eventName, sessionID, toolName, toolInputJSON string) (AggregateResult, error) {
-	matching := r.matchingHooks(toolName)
+	return r.RunEvent(ctx, eventName, EventInput{
+		SessionID:     sessionID,
+		ToolName:      toolName,
+		ToolInputJSON: toolInputJSON,
+	})
+}
+
+// RunEvent executes all matching hooks for the given event input, returning
+// an aggregated result.
+func (r *Runner) RunEvent(ctx context.Context, eventName string, input EventInput) (AggregateResult, error) {
+	matching := r.matchingHooks(input.ToolName)
 	if len(matching) == 0 {
 		return AggregateResult{Decision: DecisionNone}, nil
 	}
@@ -91,8 +108,8 @@ func (r *Runner) Run(ctx context.Context, eventName, sessionID, toolName, toolIn
 		deduped = append(deduped, h)
 	}
 
-	envVars := BuildEnv(eventName, toolName, sessionID, r.cwd, r.projectDir, toolInputJSON)
-	payload := BuildPayload(eventName, sessionID, r.cwd, toolName, toolInputJSON)
+	envVars := BuildEnvFromInput(eventName, r.cwd, r.projectDir, input)
+	payload := BuildPayloadFromInput(eventName, r.cwd, input)
 
 	results := make([]HookResult, len(deduped))
 	var wg sync.WaitGroup
@@ -106,7 +123,7 @@ func (r *Runner) Run(ctx context.Context, eventName, sessionID, toolName, toolIn
 	}
 	wg.Wait()
 
-	agg := aggregate(results, toolInputJSON)
+	agg := aggregate(results, input.ToolInputJSON)
 	agg.Hooks = make([]HookInfo, len(deduped))
 	for i, h := range deduped {
 		agg.Hooks[i] = HookInfo{
@@ -120,7 +137,7 @@ func (r *Runner) Run(ctx context.Context, eventName, sessionID, toolName, toolIn
 	}
 	slog.Info("Hook completed",
 		"event", eventName,
-		"tool", toolName,
+		"tool", input.ToolName,
 		"hooks", len(deduped),
 		"decision", agg.Decision.String(),
 	)
@@ -145,11 +162,14 @@ func (r *Runner) runOne(parentCtx context.Context, hook config.HookConfig, envVa
 	ctx, cancel := context.WithTimeout(parentCtx, timeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "sh", "-c", hook.Command)
+	shell := hookShell()
+	cmd := exec.CommandContext(ctx, shell.name, append(shell.args, hook.Command)...)
 	cmd.WaitDelay = time.Second
 	cmd.Env = envVars
 	cmd.Dir = r.cwd
-	cmd.Stdin = bytes.NewReader(payload)
+	if shell.useStdin {
+		cmd.Stdin = bytes.NewReader(payload)
+	}
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -212,4 +232,25 @@ func (r *Runner) runOne(parentCtx context.Context, hook config.HookConfig, envVa
 		"decision", result.Decision.String(),
 	)
 	return result
+}
+
+func hookShell() shellSpec {
+	if runtime.GOOS != "windows" {
+		return shellSpec{name: "sh", args: []string{"-c"}, useStdin: true}
+	}
+	for _, candidate := range []struct {
+		name     string
+		args     []string
+		useStdin bool
+	}{
+		{name: "bash.exe", args: []string{"-lc"}, useStdin: true},
+		{name: "sh.exe", args: []string{"-lc"}, useStdin: true},
+		{name: "pwsh.exe", args: []string{"-NoProfile", "-NonInteractive", "-Command"}, useStdin: false},
+		{name: "powershell.exe", args: []string{"-NoProfile", "-NonInteractive", "-Command"}, useStdin: false},
+	} {
+		if _, err := exec.LookPath(candidate.name); err == nil {
+			return shellSpec{name: candidate.name, args: candidate.args, useStdin: candidate.useStdin}
+		}
+	}
+	return shellSpec{name: "powershell.exe", args: []string{"-NoProfile", "-NonInteractive", "-Command"}, useStdin: false}
 }

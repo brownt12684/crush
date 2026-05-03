@@ -45,14 +45,9 @@ func Connect(ctx context.Context, dataDir string) (*sql.DB, error) {
 	}
 	dbPath := filepath.Join(dataDir, "crush.db")
 
-	db, err := openDB(dbPath)
+	db, err := OpenPath(ctx, dbPath)
 	if err != nil {
 		return nil, err
-	}
-
-	if err = db.PingContext(ctx); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("failed to connect to database: %w", err)
 	}
 
 	if err := initGoose(); err != nil {
@@ -63,6 +58,26 @@ func Connect(ctx context.Context, dataDir string) (*sql.DB, error) {
 	if err := goose.Up(db, "migrations"); err != nil {
 		slog.Error("Failed to apply migrations", "error", err)
 		return nil, fmt.Errorf("failed to apply migrations: %w", err)
+	}
+
+	return db, nil
+}
+
+// OpenPath opens a SQLite database connection for an explicit database path
+// without running migrations.
+func OpenPath(ctx context.Context, dbPath string) (*sql.DB, error) {
+	if dbPath == "" {
+		return nil, fmt.Errorf("database path is not set")
+	}
+
+	db, err := openDB(dbPath)
+	if err != nil {
+		return nil, err
+	}
+
+	if err = db.PingContext(ctx); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to connect to database: %w", err)
 	}
 
 	return db, nil

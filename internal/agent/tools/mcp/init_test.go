@@ -36,3 +36,22 @@ func TestMCPSession_CancelOnClose(t *testing.T) {
 	// After Close, the context must be cancelled.
 	require.ErrorIs(t, ctx.Err(), context.Canceled)
 }
+
+func TestNormalizeMCPName(t *testing.T) {
+	t.Parallel()
+
+	cases := map[string]string{
+		"stack-orchestrator":  "stack-orchestrator",
+		"orchestrator":        "stack-orchestrator",
+		"orchestrator/memory": "stack-orchestrator",
+		"memory/orchestrator": "stack-orchestrator",
+		"stack_orchestrator":  "stack-orchestrator",
+		"docker":              "docker-mcp",
+		"docker/mcp":          "docker-mcp",
+		" custom-name ":       "custom-name",
+	}
+
+	for input, expected := range cases {
+		require.Equal(t, expected, normalizeMCPName(input), input)
+	}
+}

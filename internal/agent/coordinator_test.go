@@ -8,6 +8,7 @@ import (
 	"charm.land/catwalk/pkg/catwalk"
 	"charm.land/fantasy"
 	"github.com/charmbracelet/crush/internal/config"
+	"github.com/charmbracelet/crush/internal/message"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -274,6 +275,63 @@ func TestRunSubAgent(t *testing.T) {
 		updated, err := env.sessions.Get(t.Context(), parentSession.ID)
 		require.NoError(t, err)
 		assert.InDelta(t, 0.05, updated.Cost, 1e-9)
+	})
+}
+
+func TestSummarizeCurrentTurn(t *testing.T) {
+	t.Run("aggregates tool usage across the current turn", func(t *testing.T) {
+		messages := []message.Message{
+			{
+				Role: message.User,
+				Parts: []message.ContentPart{
+					message.TextContent{Text: "previous question"},
+					message.Finish{Reason: message.FinishReason("stop")},
+				},
+			},
+			{
+				Role: message.Assistant,
+				Parts: []message.ContentPart{
+					message.TextContent{Text: "old answer"},
+					message.Finish{Reason: message.FinishReasonEndTurn},
+				},
+			},
+			{
+				Role: message.User,
+				Parts: []message.ContentPart{
+					message.TextContent{Text: "new question"},
+					message.Finish{Reason: message.FinishReason("stop")},
+				},
+			},
+			{
+				Role: message.Assistant,
+				Parts: []message.ContentPart{
+					message.ToolCall{ID: "call-1", Name: "read"},
+					message.Finish{Reason: message.FinishReasonToolUse},
+				},
+			},
+			{
+				Role: message.Tool,
+				Parts: []message.ContentPart{
+					message.ToolResult{ToolCallID: "call-1", Name: "read", Content: "ok", IsError: false},
+					message.Finish{Reason: message.FinishReason("stop")},
+				},
+			},
+			{
+				Role: message.Assistant,
+				Parts: []message.ContentPart{
+					message.TextContent{Text: "This is the final validated answer for the current turn."},
+					message.Finish{Reason: message.FinishReasonEndTurn},
+				},
+			},
+		}
+
+		summary := summarizeCurrentTurn(messages)
+		assert.Equal(t, "This is the final validated answer for the current turn.", summary.AssistantText)
+		assert.Equal(t, 1, summary.ToolCallsCount)
+		assert.Equal(t, 1, summary.ToolResultsCount)
+		assert.Equal(t, 1, summary.SuccessfulToolResultsCount)
+		assert.Equal(t, 0, summary.FailedToolResultsCount)
+		assert.Equal(t, string(message.FinishReasonEndTurn), summary.FinishReason)
 	})
 }
 

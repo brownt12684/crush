@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"time"
 
 	"charm.land/catwalk/pkg/catwalk"
 	"charm.land/fantasy"
@@ -32,6 +33,7 @@ import (
 	"github.com/charmbracelet/crush/internal/lsp"
 	"github.com/charmbracelet/crush/internal/message"
 	"github.com/charmbracelet/crush/internal/oauth/copilot"
+	"github.com/charmbracelet/crush/internal/orchestrator"
 	"github.com/charmbracelet/crush/internal/permission"
 	"github.com/charmbracelet/crush/internal/pubsub"
 	"github.com/charmbracelet/crush/internal/session"
@@ -79,14 +81,15 @@ type Coordinator interface {
 }
 
 type coordinator struct {
-	cfg         *config.ConfigStore
-	sessions    session.Service
-	messages    message.Service
-	permissions permission.Service
-	history     history.Service
-	filetracker filetracker.Service
-	lspManager  *lsp.Manager
-	notify      pubsub.Publisher[notify.Notification]
+	cfg          *config.ConfigStore
+	sessions     session.Service
+	messages     message.Service
+	permissions  permission.Service
+	history      history.Service
+	filetracker  filetracker.Service
+	lspManager   *lsp.Manager
+	notify       pubsub.Publisher[notify.Notification]
+	orchestrator *orchestrator.Client
 
 	currentAgent SessionAgent
 	agents       map[string]SessionAgent
@@ -123,6 +126,7 @@ func NewCoordinator(
 		filetracker:  filetracker,
 		lspManager:   lspManager,
 		notify:       notify,
+		orchestrator: orchestrator.NewFromEnv(),
 		agents:       make(map[string]SessionAgent),
 		allSkills:    allSkills,
 		activeSkills: activeSkills,
@@ -153,6 +157,20 @@ func NewCoordinator(
 func (c *coordinator) Run(ctx context.Context, sessionID string, prompt string, attachments ...message.Attachment) (*fantasy.AgentResult, error) {
 	if err := c.readyWg.Wait(); err != nil {
 		return nil, err
+	}
+
+	turnAppend := ""
+	turnRoute := ""
+	selectedModel := ""
+	if start, err := c.beginTurnOrchestration(ctx, sessionID, prompt, attachments); err != nil {
+		slog.Warn("Failed to start orchestrator turn checkpoint", "error", err)
+	} else if start != nil {
+		turnAppend = strings.TrimSpace(start.Prepare.SystemAppend)
+		turnRoute = strings.TrimSpace(start.Prepare.Route)
+		selectedModel = strings.TrimSpace(start.Prepare.SelectedModel)
+		if err := c.applySelectedModel(ctx, selectedModel); err != nil {
+			slog.Warn("Failed to apply orchestrator-selected model", "model", selectedModel, "error", err)
+		}
 	}
 
 	// refresh models before each run
@@ -193,10 +211,12 @@ func (c *coordinator) Run(ctx context.Context, sessionID string, prompt string, 
 		}
 	}
 
+	startTime := time.Now()
 	run := func() (*fantasy.AgentResult, error) {
 		return c.currentAgent.Run(ctx, SessionAgentCall{
 			SessionID:        sessionID,
 			Prompt:           prompt,
+			TurnSystemAppend: turnAppend,
 			Attachments:      attachments,
 			MaxOutputTokens:  maxTokens,
 			ProviderOptions:  mergedOptions,
@@ -211,26 +231,196 @@ func (c *coordinator) Run(ctx context.Context, sessionID string, prompt string, 
 	result, originalErr := run()
 	logTurnSkillUsage(sessionID, prompt, c.activeSkills, c.skillTracker, beforeLoaded)
 
+	finalResult := result
+	finalErr := originalErr
 	if c.isUnauthorized(originalErr) {
 		switch {
 		case providerCfg.OAuthToken != nil:
 			slog.Debug("Received 401. Refreshing token and retrying", "provider", providerCfg.ID)
 			if err := c.refreshOAuth2Token(ctx, providerCfg); err != nil {
-				return nil, originalErr
+				finalErr = originalErr
+				break
 			}
 			slog.Debug("Retrying request with refreshed OAuth token", "provider", providerCfg.ID)
-			return run()
+			finalResult, finalErr = run()
 		case strings.Contains(providerCfg.APIKeyTemplate, "$"):
 			slog.Debug("Received 401. Refreshing API Key template and retrying", "provider", providerCfg.ID)
 			if err := c.refreshApiKeyTemplate(ctx, providerCfg); err != nil {
-				return nil, originalErr
+				finalErr = originalErr
+				break
 			}
 			slog.Debug("Retrying request with refreshed API key", "provider", providerCfg.ID)
-			return run()
+			finalResult, finalErr = run()
 		}
 	}
 
-	return result, originalErr
+	if finalResult == nil && finalErr == nil {
+		return finalResult, finalErr
+	}
+
+	if err := c.finishTurnOrchestration(ctx, sessionID, prompt, finalResult, finalErr == nil, finalErr, time.Since(startTime), turnRoute, selectedModel); err != nil {
+		slog.Warn("Failed to finish orchestrator turn checkpoint", "error", err)
+	}
+
+	return finalResult, finalErr
+}
+
+func (c *coordinator) applySelectedModel(ctx context.Context, selectedModel string) error {
+	selectedModel = strings.TrimSpace(selectedModel)
+	if selectedModel == "" {
+		return nil
+	}
+	current, ok := c.cfg.Config().Models[config.SelectedModelTypeLarge]
+	if ok && current.Provider == "lmstudio" && current.Model == selectedModel {
+		return nil
+	}
+	return c.cfg.UpdatePreferredModel(config.ScopeGlobal, config.SelectedModelTypeLarge, config.SelectedModel{
+		Provider: "lmstudio",
+		Model:    selectedModel,
+	})
+}
+
+func (c *coordinator) beginTurnOrchestration(ctx context.Context, sessionID string, prompt string, attachments []message.Attachment) (*orchestrator.CheckpointStartResult, error) {
+	if c.orchestrator == nil || !c.orchestrator.Enabled() {
+		return nil, nil
+	}
+	task := normalizeTurnPrompt(message.PromptWithTextAttachments(prompt, attachments))
+	return c.orchestrator.CheckpointStart(
+		ctx,
+		sessionID,
+		task,
+		c.cfg.WorkingDir(),
+		true,
+		map[string]any{
+			"client":      "crushlocal",
+			"mid_session": true,
+			"task_chars":  len([]rune(task)),
+		},
+	)
+}
+
+func (c *coordinator) finishTurnOrchestration(ctx context.Context, sessionID string, prompt string, result *fantasy.AgentResult, success bool, runErr error, elapsed time.Duration, route string, selectedModel string) error {
+	if c.orchestrator == nil || !c.orchestrator.Enabled() {
+		return nil
+	}
+	normalizedPrompt := normalizeTurnPrompt(prompt)
+	messages, err := c.messages.List(ctx, sessionID)
+	if err != nil {
+		return err
+	}
+	turnSummary := summarizeCurrentTurn(messages)
+	if turnSummary.AssistantChars == 0 && turnSummary.ToolCallsCount == 0 && turnSummary.ToolResultsCount == 0 && runErr == nil {
+		return nil
+	}
+	validated := success &&
+		runErr == nil &&
+		turnSummary.AssistantChars >= 160 &&
+		turnSummary.SuccessfulToolResultsCount > 0 &&
+		turnSummary.FinishReason == string(message.FinishReasonEndTurn)
+
+	metadata := map[string]any{
+		"client":                        "crushlocal",
+		"mid_session":                   true,
+		"assistant_chars":               turnSummary.AssistantChars,
+		"tool_calls_count":              turnSummary.ToolCallsCount,
+		"tool_results_count":            turnSummary.ToolResultsCount,
+		"successful_tool_results_count": turnSummary.SuccessfulToolResultsCount,
+		"failed_tool_results_count":     turnSummary.FailedToolResultsCount,
+		"finish_reason":                 turnSummary.FinishReason,
+		"task_chars":                    len([]rune(normalizedPrompt)),
+		"route":                         route,
+		"selected_model":                selectedModel,
+		"elapsed_seconds":               elapsed.Seconds(),
+		"phase":                         "turn",
+	}
+	if result != nil {
+		promptTokens := int(result.TotalUsage.InputTokens + result.TotalUsage.CacheCreationTokens + result.TotalUsage.CacheReadTokens)
+		completionTokens := int(result.TotalUsage.OutputTokens)
+		totalTokens := promptTokens + completionTokens
+		metadata["prompt_tokens"] = promptTokens
+		metadata["completion_tokens"] = completionTokens
+		metadata["total_tokens"] = totalTokens
+		if elapsed.Seconds() > 0 && totalTokens > 0 {
+			metadata["tokens_per_second"] = float64(totalTokens) / elapsed.Seconds()
+		}
+	}
+	outcome := turnSummary.AssistantText
+	if outcome == "" && runErr != nil {
+		outcome = runErr.Error()
+	}
+	if len([]rune(outcome)) > 4000 {
+		outcomeRunes := []rune(outcome)
+		outcome = string(outcomeRunes[:4000])
+	}
+	if runErr != nil {
+		metadata["error"] = runErr.Error()
+	}
+	return c.orchestrator.CheckpointEnd(
+		ctx,
+		sessionID,
+		normalizedPrompt,
+		outcome,
+		success,
+		validated,
+		metadata,
+	)
+}
+
+type turnCheckpointSummary struct {
+	AssistantText              string
+	AssistantChars             int
+	ToolCallsCount             int
+	ToolResultsCount           int
+	SuccessfulToolResultsCount int
+	FailedToolResultsCount     int
+	FinishReason               string
+}
+
+func summarizeCurrentTurn(messages []message.Message) turnCheckpointSummary {
+	lastUserIndex := -1
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Role == message.User && !messages[i].IsSummaryMessage {
+			lastUserIndex = i
+			break
+		}
+	}
+	start := 0
+	if lastUserIndex >= 0 {
+		start = lastUserIndex + 1
+	}
+
+	summary := turnCheckpointSummary{}
+	for _, msg := range messages[start:] {
+		if msg.IsSummaryMessage {
+			continue
+		}
+		switch msg.Role {
+		case message.Assistant:
+			summary.ToolCallsCount += len(msg.ToolCalls())
+			if text := strings.TrimSpace(msg.Content().Text); text != "" {
+				summary.AssistantText = text
+				summary.AssistantChars = len([]rune(text))
+			}
+			if finishReason := string(msg.FinishReason()); finishReason != "" {
+				summary.FinishReason = finishReason
+			}
+		case message.Tool:
+			results := msg.ToolResults()
+			summary.ToolResultsCount += len(results)
+			for _, result := range results {
+				if result.IsError {
+					summary.FailedToolResultsCount++
+				} else {
+					summary.SuccessfulToolResultsCount++
+				}
+			}
+		}
+	}
+	return summary
+}
+
+func normalizeTurnPrompt(prompt string) string {
+	return strings.TrimSpace(strings.TrimLeft(prompt, "\ufeff"))
 }
 
 func getProviderOptions(model Model, providerCfg config.ProviderConfig) fantasy.ProviderOptions {
@@ -425,6 +615,8 @@ func (c *coordinator) buildAgent(ctx context.Context, prompt *prompt.Prompt, age
 		SmallModel:           small,
 		SystemPromptPrefix:   largeProviderCfg.SystemPromptPrefix,
 		SystemPrompt:         "",
+		PreTurnHooks:         buildHookRunner(c.cfg, hooks.EventPreTurn),
+		PostTurnHooks:        buildHookRunner(c.cfg, hooks.EventPostTurn),
 		IsSubAgent:           isSubAgent,
 		DisableAutoSummarize: c.cfg.Config().Options.DisableAutoSummarize,
 		IsYolo:               c.permissions.SkipRequests(),
@@ -483,11 +675,7 @@ func (c *coordinator) buildTools(ctx context.Context, agent config.Agent, isSubA
 
 	logFile := filepath.Join(c.cfg.Config().Options.DataDirectory, "logs", "crush.log")
 
-	// Build hook runner if PreToolUse hooks are configured.
-	var hookRunner *hooks.Runner
-	if preToolHooks := c.cfg.Config().Hooks[hooks.EventPreToolUse]; len(preToolHooks) > 0 {
-		hookRunner = hooks.NewRunner(preToolHooks, c.cfg.WorkingDir(), c.cfg.WorkingDir())
-	}
+	hookRunner := buildHookRunner(c.cfg, hooks.EventPreToolUse)
 
 	allTools = append(allTools,
 		tools.NewBashTool(c.permissions, c.cfg.WorkingDir(), c.cfg.Config().Options.Attribution, modelName),
@@ -504,6 +692,7 @@ func (c *coordinator) buildTools(ctx context.Context, agent config.Agent, isSubA
 		tools.NewLsTool(c.permissions, c.cfg.WorkingDir(), c.cfg.Config().Tools.Ls),
 		tools.NewSourcegraphTool(nil),
 		tools.NewTodosTool(c.sessions),
+		tools.NewTodoAliasTool(c.sessions),
 		tools.NewViewTool(c.lspManager, c.permissions, c.filetracker, c.skillTracker, c.cfg.WorkingDir(), c.cfg.Config().Options.SkillsPaths...),
 		tools.NewWriteTool(c.lspManager, c.permissions, c.history, c.filetracker, c.cfg.WorkingDir()),
 	)
@@ -552,6 +741,11 @@ func (c *coordinator) buildTools(ctx context.Context, agent config.Agent, isSubA
 		}
 	}
 	slices.SortFunc(filteredTools, func(a, b fantasy.AgentTool) int {
+		pa := toolPriority(a.Info().Name)
+		pb := toolPriority(b.Info().Name)
+		if pa != pb {
+			return cmp.Compare(pa, pb)
+		}
 		return strings.Compare(a.Info().Name, b.Info().Name)
 	})
 
@@ -563,6 +757,21 @@ func (c *coordinator) buildTools(ctx context.Context, agent config.Agent, isSubA
 	filteredTools = wrapToolsWithHooks(filteredTools, hookRunner, isSubAgent)
 
 	return filteredTools, nil
+}
+
+func buildHookRunner(cfg *config.ConfigStore, eventName string) *hooks.Runner {
+	eventHooks := cfg.Config().Hooks[eventName]
+	if len(eventHooks) == 0 {
+		return nil
+	}
+	return hooks.NewRunner(eventHooks, cfg.WorkingDir(), cfg.WorkingDir())
+}
+
+func toolPriority(name string) int {
+	if strings.HasPrefix(name, "mcp_stack-orchestrator_") {
+		return 0
+	}
+	return 1
 }
 
 // TODO: when we support multiple agents we need to change this so that we pass in the agent specific model config

@@ -2,6 +2,7 @@ package hooks
 
 import (
 	"context"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -441,14 +442,25 @@ func TestValidateHooksNormalizesEventNames(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name  string
-		input string
+		name      string
+		input     string
+		canonical string
 	}{
-		{"canonical", "PreToolUse"},
-		{"lowercase", "pretooluse"},
-		{"snake_case", "pre_tool_use"},
-		{"upper_snake", "PRE_TOOL_USE"},
-		{"mixed_case", "preToolUse"},
+		{"canonical", "PreToolUse", EventPreToolUse},
+		{"pre_turn", "PreTurn", EventPreTurn},
+		{"post_turn", "PostTurn", EventPostTurn},
+		{"lowercase", "pretooluse", EventPreToolUse},
+		{"lowercase_pre_turn", "preturn", EventPreTurn},
+		{"lowercase_post_turn", "postturn", EventPostTurn},
+		{"snake_case", "pre_tool_use", EventPreToolUse},
+		{"snake_case_pre_turn", "pre_turn", EventPreTurn},
+		{"snake_case_post_turn", "post_turn", EventPostTurn},
+		{"upper_snake", "PRE_TOOL_USE", EventPreToolUse},
+		{"upper_snake_pre_turn", "PRE_TURN", EventPreTurn},
+		{"upper_snake_post_turn", "POST_TURN", EventPostTurn},
+		{"mixed_case", "preToolUse", EventPreToolUse},
+		{"mixed_case_pre_turn", "preTurn", EventPreTurn},
+		{"mixed_case_post_turn", "postTurn", EventPostTurn},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -461,9 +473,51 @@ func TestValidateHooksNormalizesEventNames(t *testing.T) {
 				},
 			}
 			require.NoError(t, cfg.ValidateHooks())
-			require.Len(t, cfg.Hooks[EventPreToolUse], 1)
+			require.Len(t, cfg.Hooks[tt.canonical], 1)
 		})
 	}
+}
+
+func TestBuildPayloadAndEnvFromInput(t *testing.T) {
+	t.Parallel()
+
+	input := EventInput{
+		SessionID:         "sess-1",
+		ToolName:          "bash",
+		ToolInputJSON:     `{"command":"ls","file_path":"C:/tmp/test.txt"}`,
+		Prompt:            "scan the repo",
+		AssistantResponse: "done",
+		FinishReason:      "end_turn",
+		Model:             "qwen/qwen3.5-9b",
+		Provider:          "lmstudio",
+		Error:             "none",
+		DurationMS:        2500,
+		NonInteractive:    true,
+		ToolCalls:         []string{"view", "grep"},
+		MetadataJSON:      `{"tests_passed":true}`,
+	}
+
+	payload := string(BuildPayloadFromInput(EventPostTurn, "C:/work", input))
+	require.Contains(t, payload, `"event":"PostTurn"`)
+	require.Contains(t, payload, `"prompt":"scan the repo"`)
+	require.Contains(t, payload, `"assistant_response":"done"`)
+	require.Contains(t, payload, `"tool_calls":["view","grep"]`)
+	require.Contains(t, payload, `"metadata":{"tests_passed":true}`)
+
+	env := BuildEnvFromInput(EventPostTurn, "C:/work", "C:/project", input)
+	envMap := make(map[string]string, len(env))
+	for _, kv := range env {
+		parts := strings.SplitN(kv, "=", 2)
+		if len(parts) == 2 {
+			envMap[parts[0]] = parts[1]
+		}
+	}
+	require.Equal(t, "PostTurn", envMap["CRUSH_EVENT"])
+	require.Equal(t, "scan the repo", envMap["CRUSH_PROMPT"])
+	require.Equal(t, "done", envMap["CRUSH_ASSISTANT_RESPONSE"])
+	require.Equal(t, "qwen/qwen3.5-9b", envMap["CRUSH_MODEL"])
+	require.Equal(t, "view,grep", envMap["CRUSH_TOOL_CALLS"])
+	require.Equal(t, "1", envMap["CRUSH_NON_INTERACTIVE"])
 }
 
 func TestRunnerParallelExecution(t *testing.T) {
@@ -482,8 +536,12 @@ func TestRunnerParallelExecution(t *testing.T) {
 
 func TestRunnerEnvVarsPropagated(t *testing.T) {
 	t.Parallel()
+	cmd := `printf '{"decision":"allow","context":"%s"}' "$CRUSH_TOOL_NAME"`
+	if runtime.GOOS == "windows" {
+		cmd = `$obj = @{ decision = 'allow'; context = $env:CRUSH_TOOL_NAME }; $obj | ConvertTo-Json -Compress`
+	}
 	hookCfg := config.HookConfig{
-		Command: `printf '{"decision":"allow","context":"%s"}' "$CRUSH_TOOL_NAME"`,
+		Command: cmd,
 	}
 	r := NewRunner([]config.HookConfig{hookCfg}, t.TempDir(), t.TempDir())
 	result, err := r.Run(context.Background(), EventPreToolUse, "sess", "bash", `{}`)

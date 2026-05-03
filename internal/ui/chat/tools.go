@@ -249,7 +249,7 @@ func NewToolMessageItem(
 		item = NewWebFetchToolMessageItem(sty, toolCall, result, canceled)
 	case tools.WebSearchToolName:
 		item = NewWebSearchToolMessageItem(sty, toolCall, result, canceled)
-	case tools.TodosToolName:
+	case tools.TodosToolName, tools.TodoToolAliasName:
 		item = NewTodosToolMessageItem(sty, toolCall, result, canceled)
 	case tools.ReferencesToolName:
 		item = NewReferencesToolMessageItem(sty, toolCall, result, canceled)
