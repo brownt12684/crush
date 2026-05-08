@@ -17,8 +17,8 @@ forward.
 - Hooks are Claude Code-compatible
 - Crush ships with a builtin `crush-hook` skill write, edit, and configure
   hooks; just tell Crush how to configure Crush
-- Crush currently supports just one hook, `PreToolUse`, with plans to support
-  the full gamut; please let us know which hooks you'd like to see next
+- Crush currently supports `PreToolUse`, `PostToolUse`, `PreTurn`, and
+  `PostTurn`
 - Hooks run in parallel for speed, but their results compose in config order
   for determinism
 
@@ -112,7 +112,7 @@ wins when rewriting input, but first deny wins when blocking.
 
 ## Events
 
-Here are the events you can hook into (spoiler: there's currently just one):
+Here are the events you can hook into:
 
 ### PreToolUse
 
@@ -135,6 +135,27 @@ agent spawn sub-agents" still works.
 
 Hooks are keyed by event name. Only `command` is required, and you can omit
 `matcher` to match all tools.
+
+### PostToolUse
+
+This hook fires after a tool returns. Use it to observe failures, capture
+structured bash error metadata, and inspect repair attempts/results in
+near-real time.
+
+**Matched against**: the tool name.
+
+**Scope**: `PostToolUse` follows the same top-level-only rule as
+`PreToolUse`.
+
+### PreTurn
+
+This hook fires before the assistant begins a turn. Use it for logging,
+routing, or turn-level policy/audit behavior.
+
+### PostTurn
+
+This hook fires after the assistant finishes a turn. Use it for summaries,
+logging, and turn-level observability.
 
 ## Building Hooks
 
@@ -175,6 +196,12 @@ The available environment variables are:
 | `CRUSH_PROJECT_DIR`          | Project root directory.                        |
 | `CRUSH_TOOL_INPUT_COMMAND`   | For `bash` calls: the shell command being run. |
 | `CRUSH_TOOL_INPUT_FILE_PATH` | For file tools: the target file path.          |
+| `CRUSH_TOOL_CALL_ID`         | Tool call ID for tool lifecycle hooks.         |
+| `CRUSH_TOOL_RESULT`          | JSON tool result payload for `PostToolUse`.    |
+| `CRUSH_EXIT_CODE`            | Structured exit code for tool failures.        |
+| `CRUSH_RETRYABLE`            | Whether the failure was classified retryable.  |
+| `CRUSH_FAILURE_KIND`         | Structured failure kind, when available.       |
+| `CRUSH_REPAIR`               | Structured repair metadata, when available.    |
 
 #### JSON
 
@@ -571,6 +598,33 @@ Extends the common payload:
 }
 ```
 
+### Stdin payload — PostToolUse
+
+Extends the common payload:
+
+```jsonc
+{
+  // ...common fields...
+  "tool_name": "bash",
+  "tool_input": {
+    "command": "cd C:\\projects\\foo && pwd"
+  },
+  "tool_call_id": "call_123",
+  "tool_result": {
+    "tool_name": "bash",
+    "is_error": true
+  },
+  "exit_code": 127,
+  "retryable": true,
+  "failure_kind": "windows_path_translation_failure",
+  "repair": {
+    "runtime": {
+      "outcome": "succeeded"
+    }
+  }
+}
+```
+
 ### Output envelope (common)
 
 Fields a hook may print to stdout on exit 0. All are optional and apply to every
@@ -616,6 +670,12 @@ Extends the common envelope:
   },
 }
 ```
+
+### Output envelope — PostToolUse / PreTurn / PostTurn
+
+These events accept the common output envelope fields (`version`, `halt`,
+`reason`, `context`). `PostToolUse` is observational in this fork: returning
+`deny`/`allow` does not rewrite or block the already-completed tool result.
 
 ### Exit codes
 

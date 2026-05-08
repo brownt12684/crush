@@ -16,41 +16,31 @@ const (
 	loopDetectionFailedMaxRepeats = 2
 )
 
-// hasRepeatedToolCalls checks whether the agent is stuck in a loop by looking
-// at recent steps. It examines the last windowSize steps and returns true if:
-//   - any tool-call signature appears more than maxRepeats times across a full
-//     window, or
-//   - any failed individual tool interaction appears more than
-//     loopDetectionFailedMaxRepeats times, even before a full window fills.
+// hasRepeatedToolCalls is the legacy fallback loop check. It only trips on
+// repeated failed tool interactions so successful repeated reads do not get
+// treated as an agent loop by default.
 func hasRepeatedToolCalls(steps []fantasy.StepResult, windowSize, maxRepeats int) bool {
 	if len(steps) == 0 {
 		return false
 	}
+	_ = maxRepeats
 
 	windowStart := 0
 	if len(steps) > windowSize {
 		windowStart = len(steps) - windowSize
 	}
 	window := steps[windowStart:]
-	enforceGeneralThreshold := len(steps) >= windowSize
-	counts := make(map[string]int)
 	failedCounts := make(map[string]int)
 
 	for _, step := range window {
 		signatures := getToolInteractionSignatures(step.Content)
 		for _, sig := range signatures {
-			if sig.signature == "" {
+			if sig.signature == "" || !sig.failed {
 				continue
 			}
-			counts[sig.signature]++
-			if enforceGeneralThreshold && counts[sig.signature] > maxRepeats {
+			failedCounts[sig.signature]++
+			if failedCounts[sig.signature] > loopDetectionFailedMaxRepeats {
 				return true
-			}
-			if sig.failed {
-				failedCounts[sig.signature]++
-				if failedCounts[sig.signature] > loopDetectionFailedMaxRepeats {
-					return true
-				}
 			}
 		}
 	}

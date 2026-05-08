@@ -38,9 +38,16 @@ type BashPermissionsParams struct {
 type BashResponseMetadata struct {
 	StartTime        int64  `json:"start_time"`
 	EndTime          int64  `json:"end_time"`
+	Command          string `json:"command,omitempty"`
+	ExecutedCommand  string `json:"executed_command,omitempty"`
 	Output           string `json:"output"`
+	Stdout           string `json:"stdout,omitempty"`
+	Stderr           string `json:"stderr,omitempty"`
 	Description      string `json:"description"`
 	WorkingDirectory string `json:"working_directory"`
+	ExitCode         int    `json:"exit_code,omitempty"`
+	Retryable        bool   `json:"retryable,omitempty"`
+	FailureKind      string `json:"failure_kind,omitempty"`
 	Background       bool   `json:"background,omitempty"`
 	ShellID          string `json:"shell_id,omitempty"`
 }
@@ -48,9 +55,11 @@ type BashResponseMetadata struct {
 const (
 	BashToolName = "bash"
 
-	DefaultAutoBackgroundAfter = 60 // Commands taking longer automatically become background jobs
-	MaxOutputLength            = 30000
-	BashNoOutput               = "no output"
+	DefaultAutoBackgroundAfter            = 60 // Commands taking longer automatically become background jobs
+	MaxOutputLength                       = 30000
+	BashNoOutput                          = "no output"
+	BashFailureKindWindowsPathTranslation = "windows_path_translation_failure"
+	BashFailureKindWindowsShellMismatch   = "windows_shell_command_mismatch"
 )
 
 //go:embed bash.tpl
@@ -189,7 +198,7 @@ func blockFuncs() []shell.BlockFunc {
 }
 
 func NewBashTool(permissions permission.Service, workingDir string, attribution *config.Attribution, modelName string) fantasy.AgentTool {
-	return fantasy.NewAgentTool(
+	return WithAliases(fantasy.NewAgentTool(
 		BashToolName,
 		string(bashDescription(attribution, modelName)),
 		func(ctx context.Context, params BashParams, call fantasy.ToolCall) (fantasy.ToolResponse, error) {
@@ -199,9 +208,11 @@ func NewBashTool(permissions permission.Service, workingDir string, attribution 
 
 			// Determine working directory
 			execWorkingDir := cmp.Or(params.WorkingDir, workingDir)
+			originalCommand := params.Command
+			execCommand, execWorkingDir := normalizeBashInvocation(params.Command, execWorkingDir)
 
 			isSafeReadOnly := false
-			cmdLower := strings.ToLower(params.Command)
+			cmdLower := strings.ToLower(execCommand)
 
 			for _, safe := range safeCommands {
 				if strings.HasPrefix(cmdLower, safe) {
@@ -224,7 +235,7 @@ func NewBashTool(permissions permission.Service, workingDir string, attribution 
 						ToolCallID:  call.ID,
 						ToolName:    BashToolName,
 						Action:      "execute",
-						Description: fmt.Sprintf("Execute command: %s", params.Command),
+						Description: fmt.Sprintf("Execute command: %s", originalCommand),
 						Params:      BashPermissionsParams(params),
 					},
 				)
@@ -242,7 +253,7 @@ func NewBashTool(permissions permission.Service, workingDir string, attribution 
 				bgManager := shell.GetBackgroundShellManager()
 				bgManager.Cleanup()
 				// Use background context so it continues after tool returns
-				bgShell, err := bgManager.Start(context.Background(), execWorkingDir, blockFuncs(), params.Command, params.Description)
+				bgShell, err := bgManager.Start(context.Background(), execWorkingDir, blockFuncs(), execCommand, params.Description)
 				if err != nil {
 					return fantasy.ToolResponse{}, fmt.Errorf("error starting background shell: %w", err)
 				}
@@ -261,27 +272,18 @@ func NewBashTool(permissions permission.Service, workingDir string, attribution 
 						return fantasy.ToolResponse{}, fmt.Errorf("[Job %s] error executing command: %w", bgShell.ID, execErr)
 					}
 
-					stdout = formatOutput(stdout, stderr, execErr)
-
-					metadata := BashResponseMetadata{
-						StartTime:        startTime.UnixMilli(),
-						EndTime:          time.Now().UnixMilli(),
-						Output:           stdout,
-						Description:      params.Description,
-						Background:       params.RunInBackground,
-						WorkingDirectory: bgShell.WorkingDir,
+					if interrupted || exitCode != 0 {
+						return buildBashFailureResponse(startTime, params.Description, originalCommand, execCommand, bgShell.Shell.GetWorkingDir(), stdout, stderr, execErr, params.RunInBackground), nil
 					}
-					if stdout == "" {
-						return fantasy.WithResponseMetadata(fantasy.NewTextResponse(BashNoOutput), metadata), nil
-					}
-					stdout += fmt.Sprintf("\n\n<cwd>%s</cwd>", normalizeWorkingDir(bgShell.WorkingDir))
-					return fantasy.WithResponseMetadata(fantasy.NewTextResponse(stdout), metadata), nil
+					return buildBashSuccessResponse(startTime, params.Description, originalCommand, execCommand, bgShell.Shell.GetWorkingDir(), stdout, stderr, params.RunInBackground), nil
 				}
 
 				// Still running after fast-failure check - return as background job
 				metadata := BashResponseMetadata{
 					StartTime:        startTime.UnixMilli(),
 					EndTime:          time.Now().UnixMilli(),
+					Command:          originalCommand,
+					ExecutedCommand:  execCommand,
 					Description:      params.Description,
 					WorkingDirectory: bgShell.WorkingDir,
 					Background:       true,
@@ -297,7 +299,7 @@ func NewBashTool(permissions permission.Service, workingDir string, attribution 
 			// Start with detached context so it can survive if moved to background
 			bgManager := shell.GetBackgroundShellManager()
 			bgManager.Cleanup()
-			bgShell, err := bgManager.Start(context.Background(), execWorkingDir, blockFuncs(), params.Command, params.Description)
+			bgShell, err := bgManager.Start(context.Background(), execWorkingDir, blockFuncs(), execCommand, params.Description)
 			if err != nil {
 				return fantasy.ToolResponse{}, fmt.Errorf("error starting shell: %w", err)
 			}
@@ -345,27 +347,18 @@ func NewBashTool(permissions permission.Service, workingDir string, attribution 
 					return fantasy.ToolResponse{}, fmt.Errorf("[Job %s] error executing command: %w", bgShell.ID, execErr)
 				}
 
-				stdout = formatOutput(stdout, stderr, execErr)
-
-				metadata := BashResponseMetadata{
-					StartTime:        startTime.UnixMilli(),
-					EndTime:          time.Now().UnixMilli(),
-					Output:           stdout,
-					Description:      params.Description,
-					Background:       params.RunInBackground,
-					WorkingDirectory: bgShell.WorkingDir,
+				if interrupted || exitCode != 0 {
+					return buildBashFailureResponse(startTime, params.Description, originalCommand, execCommand, bgShell.Shell.GetWorkingDir(), stdout, stderr, execErr, params.RunInBackground), nil
 				}
-				if stdout == "" {
-					return fantasy.WithResponseMetadata(fantasy.NewTextResponse(BashNoOutput), metadata), nil
-				}
-				stdout += fmt.Sprintf("\n\n<cwd>%s</cwd>", normalizeWorkingDir(bgShell.WorkingDir))
-				return fantasy.WithResponseMetadata(fantasy.NewTextResponse(stdout), metadata), nil
+				return buildBashSuccessResponse(startTime, params.Description, originalCommand, execCommand, bgShell.Shell.GetWorkingDir(), stdout, stderr, params.RunInBackground), nil
 			}
 
 			// Still running - keep as background job
 			metadata := BashResponseMetadata{
 				StartTime:        startTime.UnixMilli(),
 				EndTime:          time.Now().UnixMilli(),
+				Command:          originalCommand,
+				ExecutedCommand:  execCommand,
 				Description:      params.Description,
 				WorkingDirectory: bgShell.WorkingDir,
 				Background:       true,
@@ -373,7 +366,7 @@ func NewBashTool(permissions permission.Service, workingDir string, attribution 
 			}
 			response := fmt.Sprintf("Command is taking longer than expected and has been moved to background.\n\nBackground shell ID: %s\n\nUse job_output tool to view output or job_kill to terminate.", bgShell.ID)
 			return fantasy.WithResponseMetadata(fantasy.NewTextResponse(response), metadata), nil
-		})
+		}), []string{"execute"}, []string{"bash_commands"})
 }
 
 // formatOutput formats the output of a completed command with error handling
@@ -439,4 +432,251 @@ func normalizeWorkingDir(path string) string {
 		path = strings.ReplaceAll(path, fsext.WindowsWorkingDirDrive(), "")
 	}
 	return filepath.ToSlash(path)
+}
+
+func buildBashSuccessResponse(
+	startTime time.Time,
+	description string,
+	originalCommand string,
+	executedCommand string,
+	workingDir string,
+	stdout string,
+	stderr string,
+	background bool,
+) fantasy.ToolResponse {
+	truncatedStdout := truncateOutput(stdout)
+	truncatedStderr := truncateOutput(stderr)
+	output := formatOutput(stdout, stderr, nil)
+	metadata := BashResponseMetadata{
+		StartTime:        startTime.UnixMilli(),
+		EndTime:          time.Now().UnixMilli(),
+		Command:          originalCommand,
+		ExecutedCommand:  executedCommand,
+		Output:           output,
+		Stdout:           truncatedStdout,
+		Stderr:           truncatedStderr,
+		Description:      description,
+		WorkingDirectory: workingDir,
+		Background:       background,
+	}
+	if output == "" {
+		return fantasy.WithResponseMetadata(fantasy.NewTextResponse(BashNoOutput), metadata)
+	}
+	output += fmt.Sprintf("\n\n<cwd>%s</cwd>", normalizeWorkingDir(workingDir))
+	return fantasy.WithResponseMetadata(fantasy.NewTextResponse(output), metadata)
+}
+
+func buildBashFailureResponse(
+	startTime time.Time,
+	description string,
+	originalCommand string,
+	executedCommand string,
+	workingDir string,
+	stdout string,
+	stderr string,
+	execErr error,
+	background bool,
+) fantasy.ToolResponse {
+	output := formatOutput(stdout, stderr, execErr)
+	exitCode := shell.ExitCode(execErr)
+	retryable, failureKind := classifyBashFailure(originalCommand, workingDir, stdout, stderr, execErr)
+	if output == "" {
+		output = fmt.Sprintf("Command failed with exit code %d", exitCode)
+	}
+	output += fmt.Sprintf("\n\n<cwd>%s</cwd>", normalizeWorkingDir(workingDir))
+	metadata := BashResponseMetadata{
+		StartTime:        startTime.UnixMilli(),
+		EndTime:          time.Now().UnixMilli(),
+		Command:          originalCommand,
+		ExecutedCommand:  executedCommand,
+		Output:           output,
+		Stdout:           truncateOutput(stdout),
+		Stderr:           truncateOutput(stderr),
+		Description:      description,
+		WorkingDirectory: workingDir,
+		ExitCode:         exitCode,
+		Retryable:        retryable,
+		FailureKind:      failureKind,
+		Background:       background,
+	}
+	return fantasy.WithResponseMetadata(fantasy.NewTextErrorResponse(output), metadata)
+}
+
+func normalizeBashInvocation(command string, execWorkingDir string) (string, string) {
+	if runtime.GOOS != "windows" {
+		return command, execWorkingDir
+	}
+	if path, rest, ok := splitLeadingWindowsCD(command); ok {
+		return quoteLeadingWindowsExecutable(rest), normalizeWindowsPath(path)
+	}
+	return quoteLeadingWindowsExecutable(command), normalizeWindowsPath(execWorkingDir)
+}
+
+func splitLeadingWindowsCD(command string) (string, string, bool) {
+	before, after, ok := strings.Cut(command, "&&")
+	if !ok {
+		return "", "", false
+	}
+
+	prefix := strings.TrimSpace(before)
+	if prefix == "" {
+		return "", "", false
+	}
+	lowerPrefix := strings.ToLower(prefix)
+	switch {
+	case strings.HasPrefix(lowerPrefix, "cd /d "):
+		prefix = strings.TrimSpace(prefix[len("cd /d "):])
+	case strings.HasPrefix(lowerPrefix, "cd "):
+		prefix = strings.TrimSpace(prefix[len("cd "):])
+	default:
+		return "", "", false
+	}
+
+	path := strings.Trim(prefix, `"'`)
+	rest := strings.TrimSpace(after)
+	if rest == "" || !isLikelyWindowsPath(path) {
+		return "", "", false
+	}
+	return path, rest, true
+}
+
+func isLikelyWindowsPath(path string) bool {
+	if len(path) < 3 {
+		return false
+	}
+	drive := path[0]
+	return ((drive >= 'a' && drive <= 'z') || (drive >= 'A' && drive <= 'Z')) &&
+		path[1] == ':' &&
+		(path[2] == '\\' || path[2] == '/')
+}
+
+func normalizeWindowsPath(path string) string {
+	if runtime.GOOS != "windows" {
+		return path
+	}
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return path
+	}
+	return filepath.Clean(strings.ReplaceAll(path, "/", `\`))
+}
+
+func quoteLeadingWindowsExecutable(command string) string {
+	command = strings.TrimSpace(command)
+	if command == "" {
+		return command
+	}
+	if strings.HasPrefix(command, `"`) || strings.HasPrefix(command, `'`) {
+		return command
+	}
+	if !isLikelyWindowsPath(command) {
+		return command
+	}
+
+	lower := strings.ToLower(command)
+	bestEnd := -1
+	for _, ext := range []string{".exe", ".bat", ".cmd", ".com", ".ps1", ".py"} {
+		idx := strings.Index(lower, ext)
+		if idx < 0 {
+			continue
+		}
+		end := idx + len(ext)
+		if end < len(command) {
+			next := command[end]
+			if next != ' ' && next != '\t' && next != '&' && next != '|' && next != ';' {
+				continue
+			}
+		}
+		if bestEnd == -1 || end < bestEnd {
+			bestEnd = end
+		}
+	}
+	if bestEnd <= 0 {
+		return command
+	}
+
+	pathPart := command[:bestEnd]
+	rest := strings.TrimLeft(command[bestEnd:], " \t")
+	normalizedPath := filepath.ToSlash(filepath.Clean(strings.ReplaceAll(pathPart, "/", `\`)))
+	if rest == "" {
+		return `"` + normalizedPath + `"`
+	}
+	return `"` + normalizedPath + `" ` + rest
+}
+
+func classifyBashFailure(command string, workingDir string, stdout string, stderr string, execErr error) (bool, string) {
+	if runtime.GOOS != "windows" {
+		return false, ""
+	}
+	if looksLikeWindowsShellMismatch(command, stdout, stderr, execErr) {
+		return true, BashFailureKindWindowsShellMismatch
+	}
+	if !looksLikeWindowsPathCommand(command) {
+		return false, ""
+	}
+
+	errorText := strings.ToLower(strings.Join([]string{
+		stderr,
+		stdout,
+		errorString(execErr),
+	}, "\n"))
+	if strings.Contains(errorText, "no such file or directory") ||
+		strings.Contains(errorText, "not a directory") ||
+		strings.Contains(errorText, "could not parse command") ||
+		strings.Contains(errorText, "invalid char escape") ||
+		strings.Contains(errorText, `\p`) ||
+		strings.Contains(errorText, `\u`) ||
+		(strings.Contains(strings.ToLower(command), "cd ") && strings.Contains(errorText, "not found")) ||
+		(isLikelyWindowsPath(strings.Trim(command, `"'`)) && strings.Contains(errorText, "not found")) {
+		return true, BashFailureKindWindowsPathTranslation
+	}
+	return false, ""
+}
+
+func looksLikeWindowsShellMismatch(command string, stdout string, stderr string, execErr error) bool {
+	errorText := strings.ToLower(strings.Join([]string{
+		stderr,
+		stdout,
+		errorString(execErr),
+	}, "\n"))
+	commandText := strings.ToLower(strings.TrimSpace(command))
+	if !strings.Contains(errorText, "executable file not found in $path") &&
+		!strings.Contains(errorText, "not found") {
+		return false
+	}
+	if strings.Contains(commandText, "| head") || strings.Contains(commandText, "| tail") {
+		return true
+	}
+	if strings.Contains(commandText, "select-object") ||
+		strings.Contains(commandText, "format-table") ||
+		strings.Contains(commandText, "where-object") {
+		return true
+	}
+	return false
+}
+
+func looksLikeWindowsPathCommand(command string) bool {
+	command = strings.TrimSpace(command)
+	if command == "" {
+		return false
+	}
+	if isLikelyWindowsPath(command) {
+		return true
+	}
+	lowerCommand := strings.ToLower(command)
+	if idx := strings.Index(lowerCommand, "cd "); idx >= 0 {
+		segment := command[idx+3:]
+		segment = strings.TrimLeft(segment, " ")
+		segment = strings.TrimLeft(segment, "/d ")
+		segment = strings.Trim(segment, `"'`)
+		return isLikelyWindowsPath(segment)
+	}
+	return strings.Contains(command, `:\`) || strings.Contains(command, `:/`)
+}
+
+func errorString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }

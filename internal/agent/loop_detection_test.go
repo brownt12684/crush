@@ -121,7 +121,7 @@ func TestHasRepeatedToolCalls(t *testing.T) {
 		}
 	})
 
-	t.Run("loop detected", func(t *testing.T) {
+	t.Run("repeated successful calls are not treated as loops by fallback detector", func(t *testing.T) {
 		// 6 identical steps in a window of 10 with maxRepeats=5 → detected
 		steps := make([]fantasy.StepResult, 10)
 		for i := range 6 {
@@ -131,8 +131,8 @@ func TestHasRepeatedToolCalls(t *testing.T) {
 			steps[i] = makeToolStep("tool", fmt.Sprintf(`{"i":%d}`, i), fmt.Sprintf("result-%d", i))
 		}
 		result := hasRepeatedToolCalls(steps, 10, 5)
-		if !result {
-			t.Error("expected true when same signature appears more than maxRepeats times")
+		if result {
+			t.Error("expected false for successful repeated calls in fallback detector")
 		}
 	})
 

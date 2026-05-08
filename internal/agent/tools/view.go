@@ -66,7 +66,7 @@ func NewViewTool(
 	workingDir string,
 	skillsPaths ...string,
 ) fantasy.AgentTool {
-	return fantasy.NewAgentTool(
+	return WithAliases(fantasy.NewAgentTool(
 		ViewToolName,
 		FirstLineDescription(viewDescription),
 		func(ctx context.Context, params ViewParams, call fantasy.ToolCall) (fantasy.ToolResponse, error) {
@@ -230,7 +230,7 @@ func NewViewTool(
 				fantasy.NewTextResponse(output),
 				meta,
 			), nil
-		})
+		}), nil, []string{"read"})
 }
 
 func addLineNumbers(content string, startLine int) string {

@@ -40,6 +40,7 @@ import (
 	"github.com/charmbracelet/crush/internal/pubsub"
 	"github.com/charmbracelet/crush/internal/session"
 	"github.com/charmbracelet/crush/internal/skills"
+	"github.com/charmbracelet/crush/internal/supervisornotice"
 	"github.com/charmbracelet/crush/internal/ui/anim"
 	"github.com/charmbracelet/crush/internal/ui/attachments"
 	"github.com/charmbracelet/crush/internal/ui/chat"
@@ -88,6 +89,8 @@ const editorHeightMargin = 2
 
 // TextareaMinHeight is the minimum height of the prompt textarea.
 const TextareaMinHeight = 3
+
+const supervisorNoticePollInterval = 1200 * time.Millisecond
 
 // uiFocusState represents the current focus state of the UI.
 type uiFocusState uint8
@@ -156,6 +159,10 @@ type (
 	// fetched from the API.
 	creditsUpdatedMsg struct {
 		credits int
+	}
+	supervisorNoticePollMsg struct {
+		notice *supervisornotice.Notice
+		err    error
 	}
 )
 
@@ -279,6 +286,9 @@ type UI struct {
 		index    int
 		draft    string
 	}
+
+	supervisorNotices      *supervisornotice.Store
+	lastSupervisorNoticeID string
 }
 
 // New creates a new instance of the [UI] model.
@@ -344,6 +354,14 @@ func New(com *common.Common, initialSessionID string, continueLast bool) *UI {
 		initialSessionID:    initialSessionID,
 		continueLastSession: continueLast,
 	}
+	if dataDir := strings.TrimSpace(com.Config().Options.DataDirectory); dataDir != "" {
+		store, err := supervisornotice.NewStore(context.Background(), dataDir)
+		if err != nil {
+			slog.Warn("Failed to initialize supervisor notice store", "error", err)
+		} else {
+			ui.supervisorNotices = store
+		}
+	}
 
 	status := NewStatus(com, ui)
 
@@ -398,6 +416,7 @@ func (m *UI) Init() tea.Cmd {
 	if m.com.IsHyper() {
 		cmds = append(cmds, m.fetchHyperCredits())
 	}
+	cmds = append(cmds, m.pollSupervisorNotice())
 	return tea.Batch(cmds...)
 }
 
@@ -521,6 +540,7 @@ func (m *UI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.setState(uiChat, m.focus)
 		m.session = msg.session
+		m.lastSupervisorNoticeID = ""
 		m.sessionFiles = msg.files
 		cmds = append(cmds, m.startLSPs(msg.lspFilePaths()))
 		msgs, err := m.com.Workspace.ListMessages(context.Background(), m.session.ID)
@@ -868,6 +888,45 @@ func (m *UI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	case creditsUpdatedMsg:
 		m.hyperCredits = &msg.credits
+	case supervisorNoticePollMsg:
+		cmds = append(cmds, m.pollSupervisorNotice())
+		if msg.err != nil {
+			slog.Warn("Failed to poll supervisor notices", "error", msg.err)
+			break
+		}
+		if msg.notice == nil || msg.notice.ID == "" || msg.notice.ID == m.lastSupervisorNoticeID {
+			break
+		}
+		m.lastSupervisorNoticeID = msg.notice.ID
+		if m.session != nil && m.session.ID == msg.notice.SessionID && m.com.Workspace.AgentIsSessionBusy(m.session.ID) {
+			m.com.Workspace.AgentCancel(m.session.ID)
+			m.com.Workspace.AgentClearQueue(m.session.ID)
+		}
+		if m.supervisorNotices != nil {
+			if err := m.supervisorNotices.MarkShown(context.Background(), msg.notice.ID); err != nil {
+				slog.Warn("Failed to mark supervisor notice as shown", "notice_id", msg.notice.ID, "error", err)
+			}
+		}
+		statusText := msg.notice.Body
+		if msg.notice.SelectedModel != "" {
+			statusText += " Suggested model: " + msg.notice.SelectedModel + "."
+		}
+		statusText += " Session paused; continue manually when ready."
+		m.status.SetInfoMsg(util.InfoMsg{
+			Type: util.InfoTypeWarn,
+			Msg:  statusText,
+			TTL:  20 * time.Second,
+		})
+		cmds = append(cmds, clearInfoMsgCmd(20*time.Second))
+		if m.session != nil && m.session.ID == msg.notice.SessionID {
+			cmds = append(cmds, m.appendSupervisorNoticeMessage(*msg.notice))
+		}
+		if cmd := m.sendNotification(notification.Notification{
+			Title:   "Supervisor paused session",
+			Message: msg.notice.Body,
+		}); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
 	case util.InfoMsg:
 		if msg.Type == util.InfoTypeError {
 			slog.Error("Error reported", "error", msg.Msg)
@@ -1109,6 +1168,42 @@ func (m *UI) appendSessionMessage(msg message.Message) tea.Cmd {
 		}
 	}
 	return tea.Sequence(cmds...)
+}
+
+func (m *UI) appendSupervisorNoticeMessage(notice supervisornotice.Notice) tea.Cmd {
+	if m.session == nil || notice.SessionID != m.session.ID {
+		return nil
+	}
+	text := "[Supervisor intervention]\n" + notice.Body
+	if notice.SelectedModel != "" {
+		text += "\nSuggested model: " + notice.SelectedModel
+	}
+	if notice.CorrectivePrompt != "" {
+		text += "\n\n" + notice.CorrectivePrompt
+	}
+	text += "\n\nAutonomous continuation is paused. Continue manually when ready."
+	msg := message.Message{
+		ID:        "supervisor-notice-" + notice.ID,
+		Role:      message.Assistant,
+		SessionID: notice.SessionID,
+		Parts: []message.ContentPart{
+			message.TextContent{Text: text},
+		},
+		Model:     notice.SelectedModel,
+		CreatedAt: notice.CreatedAt,
+		UpdatedAt: notice.CreatedAt,
+	}
+	return m.appendSessionMessage(msg)
+}
+
+func (m *UI) pollSupervisorNotice() tea.Cmd {
+	return tea.Tick(supervisorNoticePollInterval, func(time.Time) tea.Msg {
+		if m.supervisorNotices == nil || m.session == nil || m.session.ID == "" {
+			return supervisorNoticePollMsg{}
+		}
+		notice, err := m.supervisorNotices.GetLatestPending(context.Background(), m.session.ID)
+		return supervisorNoticePollMsg{notice: notice, err: err}
+	})
 }
 
 func (m *UI) handleClickFocus(msg tea.MouseClickMsg) (cmd tea.Cmd) {
@@ -3142,6 +3237,11 @@ func (m *UI) sendMessage(content string, attachments ...message.Attachment) tea.
 	}
 
 	ctx := context.Background()
+	if m.supervisorNotices != nil && m.session != nil && m.session.ID != "" {
+		if err := m.supervisorNotices.AcknowledgeSession(ctx, m.session.ID); err != nil {
+			slog.Warn("Failed to acknowledge supervisor notices", "session_id", m.session.ID, "error", err)
+		}
+	}
 	cmds = append(cmds, func() tea.Msg {
 		for _, path := range m.sessionFileReads {
 			m.com.Workspace.FileTrackerRecordRead(ctx, m.session.ID, path)

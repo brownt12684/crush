@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -466,6 +467,12 @@ func outputSessionHuman(ctx context.Context, cfg *config.ConfigStore, sess sessi
 		}
 		fmt.Fprintln(&buf, keyStyle.Render("Skills: ")+valStyle.Render(strings.Join(skillNames, ", ")))
 	}
+	for _, repair := range meta.Repairs {
+		fmt.Fprintln(&buf, keyStyle.Render("Repair: ")+valStyle.Render(repair.Summary))
+	}
+	for _, loop := range meta.Loops {
+		fmt.Fprintln(&buf, keyStyle.Render("Loop:  ")+valStyle.Render(loop.Summary))
+	}
 	if meta.Orchestrator != nil {
 		if decision := meta.Orchestrator.LastDecision; decision != nil {
 			route := strings.TrimSpace(decision.Route)
@@ -587,6 +594,8 @@ type sessionShowMeta struct {
 	CompletionTokens int64                    `json:"completion_tokens"`
 	TotalTokens      int64                    `json:"total_tokens"`
 	Skills           []sessionShowSkill       `json:"skills,omitempty"`
+	Repairs          []sessionShowRepair      `json:"repairs,omitempty"`
+	Loops            []sessionShowLoop        `json:"loops,omitempty"`
 	Orchestrator     *sessionShowOrchestrator `json:"orchestrator,omitempty"`
 }
 
@@ -603,6 +612,54 @@ type sessionShowSkill struct {
 	Name        string `json:"name"`
 	Description string `json:"description"`
 	LoadedAt    string `json:"loaded_at"`
+}
+
+type sessionShowRepair struct {
+	ToolCallID        string   `json:"tool_call_id,omitempty"`
+	ToolName          string   `json:"tool_name,omitempty"`
+	RequestedToolName string   `json:"requested_tool_name,omitempty"`
+	CanonicalToolName string   `json:"canonical_tool_name,omitempty"`
+	Scope             string   `json:"scope"`
+	Outcome           string   `json:"outcome,omitempty"`
+	FailureKind       string   `json:"failure_kind,omitempty"`
+	AttemptCount      int      `json:"attempt_count,omitempty"`
+	AliasApplied      bool     `json:"alias_applied,omitempty"`
+	AliasSource       string   `json:"alias_source,omitempty"`
+	Candidates        []string `json:"candidates,omitempty"`
+	ExposedTools      []string `json:"exposed_tools,omitempty"`
+	Retryable         bool     `json:"retryable,omitempty"`
+	RepairAttempted   bool     `json:"repair_attempted,omitempty"`
+	RepairSucceeded   bool     `json:"repair_succeeded,omitempty"`
+	RepairExhausted   bool     `json:"repair_exhausted,omitempty"`
+	Summary           string   `json:"summary"`
+}
+
+type sessionShowLoop struct {
+	ToolCallID          string                  `json:"tool_call_id,omitempty"`
+	ToolName            string                  `json:"tool_name,omitempty"`
+	NormalizedSignature string                  `json:"normalized_signature,omitempty"`
+	Classification      string                  `json:"classification,omitempty"`
+	OutcomeClass        string                  `json:"outcome_class,omitempty"`
+	LoopKind            string                  `json:"loop_kind,omitempty"`
+	StreakCount         int                     `json:"streak_count,omitempty"`
+	SuggestedAction     string                  `json:"suggested_action,omitempty"`
+	BlockedTool         bool                    `json:"blocked_tool,omitempty"`
+	Reason              string                  `json:"reason,omitempty"`
+	RecentToolCalls     []sessionShowLoopCall   `json:"recent_tool_calls,omitempty"`
+	RecentToolResults   []sessionShowLoopResult `json:"recent_tool_results,omitempty"`
+	Summary             string                  `json:"summary"`
+}
+
+type sessionShowLoopCall struct {
+	ToolName string `json:"tool_name,omitempty"`
+	Input    string `json:"input,omitempty"`
+}
+
+type sessionShowLoopResult struct {
+	ToolName  string `json:"tool_name,omitempty"`
+	IsError   bool   `json:"is_error,omitempty"`
+	Summary   string `json:"summary,omitempty"`
+	Retryable bool   `json:"retryable,omitempty"`
 }
 
 type sessionShowMessage struct {
@@ -634,6 +691,7 @@ type sessionShowPart struct {
 	Content  string `json:"content,omitempty"`
 	IsError  bool   `json:"is_error,omitempty"`
 	MIMEType string `json:"mime_type,omitempty"`
+	Metadata string `json:"metadata,omitempty"`
 
 	// Binary
 	Size int64 `json:"size,omitempty"`
@@ -693,6 +751,8 @@ func buildSessionShowMeta(ctx context.Context, sess session.Session, msgs []*mes
 		CompletionTokens: sess.CompletionTokens,
 		TotalTokens:      sess.PromptTokens + sess.CompletionTokens,
 		Skills:           extractSkillsFromMessages(msgs),
+		Repairs:          extractRepairStatuses(msgs),
+		Loops:            extractLoopStatuses(msgs),
 	}
 
 	obs, err := orchestrator.LoadSessionObservability(ctx, sess.ID)
@@ -715,6 +775,273 @@ func buildSessionShowMeta(ctx context.Context, sess session.Session, msgs []*mes
 	}
 
 	return meta
+}
+
+type sessionToolMetadataEnvelope struct {
+	Repair sessionRepairMetadata `json:"repair"`
+	Loop   *sessionLoopMetadata  `json:"loop,omitempty"`
+}
+
+const (
+	sessionRepairFailureKindAliasRewritten  = "alias_rewritten"
+	sessionRepairFailureKindInvalidToolName = "invalid_tool_name"
+	sessionRepairFailureKindInvalidSchema   = "invalid_schema"
+)
+
+type sessionRepairMetadata struct {
+	RequestedToolName string                      `json:"requested_tool_name,omitempty"`
+	OriginalToolName  string                      `json:"original_tool_name,omitempty"`
+	CanonicalToolName string                      `json:"canonical_tool_name,omitempty"`
+	ResolvedToolName  string                      `json:"resolved_tool_name,omitempty"`
+	AliasApplied      bool                        `json:"alias_applied,omitempty"`
+	AliasSource       string                      `json:"alias_source,omitempty"`
+	Candidates        []string                    `json:"candidates,omitempty"`
+	ExposedTools      []string                    `json:"exposed_tools,omitempty"`
+	FailureKind       string                      `json:"failure_kind,omitempty"`
+	Retryable         bool                        `json:"retryable,omitempty"`
+	RepairAttempted   bool                        `json:"repair_attempted,omitempty"`
+	RepairSucceeded   bool                        `json:"repair_succeeded,omitempty"`
+	RepairExhausted   bool                        `json:"repair_exhausted,omitempty"`
+	AttemptCount      int                         `json:"attempt_count,omitempty"`
+	Outcome           string                      `json:"outcome,omitempty"`
+	Runtime           *sessionRuntimeRepairStatus `json:"runtime,omitempty"`
+}
+
+type sessionRuntimeRepairStatus struct {
+	OriginalToolName string                    `json:"original_tool_name,omitempty"`
+	AttemptCount     int                       `json:"attempt_count,omitempty"`
+	Outcome          string                    `json:"outcome,omitempty"`
+	ExhaustedReason  string                    `json:"exhausted_reason,omitempty"`
+	RepairedToolName string                    `json:"repaired_tool_name,omitempty"`
+	InitialFailure   sessionRuntimeFailureMeta `json:"initial_failure"`
+}
+
+type sessionRuntimeFailureMeta struct {
+	Retryable   bool   `json:"retryable"`
+	FailureKind string `json:"failure_kind,omitempty"`
+}
+
+type sessionLoopMetadata struct {
+	ToolName                   string                  `json:"tool_name,omitempty"`
+	NormalizedSignature        string                  `json:"normalized_signature,omitempty"`
+	Classification             string                  `json:"classification,omitempty"`
+	OutcomeClass               string                  `json:"outcome_class,omitempty"`
+	LoopKind                   string                  `json:"loop_kind,omitempty"`
+	StreakCount                int                     `json:"streak_count,omitempty"`
+	SuggestedAction            string                  `json:"suggested_action,omitempty"`
+	BlockedTool                bool                    `json:"blocked_tool,omitempty"`
+	Reason                     string                  `json:"reason,omitempty"`
+	RecentToolCalls            []sessionShowLoopCall   `json:"recent_tool_calls,omitempty"`
+	RecentToolResults          []sessionShowLoopResult `json:"recent_tool_results,omitempty"`
+	SupervisorHandoffTriggered bool                    `json:"supervisor_handoff_triggered,omitempty"`
+}
+
+func extractRepairStatuses(msgs []*message.Message) []sessionShowRepair {
+	repairs := make([]sessionShowRepair, 0)
+	for _, msg := range msgs {
+		for _, part := range msg.Parts {
+			tr, ok := part.(message.ToolResult)
+			if !ok || tr.Metadata == "" {
+				continue
+			}
+
+			var envelope sessionToolMetadataEnvelope
+			if err := json.Unmarshal([]byte(tr.Metadata), &envelope); err != nil {
+				continue
+			}
+
+			if runtimeRepair := envelope.Repair.Runtime; runtimeRepair != nil {
+				repairs = append(repairs, sessionShowRepair{
+					ToolCallID:        tr.ToolCallID,
+					ToolName:          cmp.Or(runtimeRepair.OriginalToolName, tr.Name),
+					RequestedToolName: cmp.Or(envelope.Repair.RequestedToolName, envelope.Repair.OriginalToolName, tr.Name),
+					CanonicalToolName: cmp.Or(envelope.Repair.CanonicalToolName, envelope.Repair.ResolvedToolName, tr.Name),
+					Scope:             "runtime",
+					Outcome:           runtimeRepair.Outcome,
+					FailureKind:       runtimeRepair.InitialFailure.FailureKind,
+					AttemptCount:      runtimeRepair.AttemptCount,
+					AliasApplied:      envelope.Repair.AliasApplied,
+					AliasSource:       envelope.Repair.AliasSource,
+					Candidates:        append([]string(nil), envelope.Repair.Candidates...),
+					ExposedTools:      append([]string(nil), envelope.Repair.ExposedTools...),
+					Retryable:         runtimeRepair.InitialFailure.Retryable,
+					RepairAttempted:   true,
+					RepairSucceeded:   runtimeRepair.Outcome == "succeeded",
+					RepairExhausted:   runtimeRepair.Outcome == "exhausted",
+					Summary:           summarizeRuntimeRepair(envelope.Repair, runtimeRepair, tr.Name),
+				})
+				continue
+			}
+
+			if envelope.Repair.Outcome != "" {
+				repairs = append(repairs, sessionShowRepair{
+					ToolCallID:        tr.ToolCallID,
+					ToolName:          cmp.Or(envelope.Repair.CanonicalToolName, envelope.Repair.ResolvedToolName, envelope.Repair.OriginalToolName, tr.Name),
+					RequestedToolName: cmp.Or(envelope.Repair.RequestedToolName, envelope.Repair.OriginalToolName, tr.Name),
+					CanonicalToolName: cmp.Or(envelope.Repair.CanonicalToolName, envelope.Repair.ResolvedToolName, tr.Name),
+					Scope:             "validation",
+					Outcome:           envelope.Repair.Outcome,
+					FailureKind:       envelope.Repair.FailureKind,
+					AttemptCount:      envelope.Repair.AttemptCount,
+					AliasApplied:      envelope.Repair.AliasApplied,
+					AliasSource:       envelope.Repair.AliasSource,
+					Candidates:        append([]string(nil), envelope.Repair.Candidates...),
+					ExposedTools:      append([]string(nil), envelope.Repair.ExposedTools...),
+					Retryable:         envelope.Repair.Retryable,
+					RepairAttempted:   envelope.Repair.RepairAttempted,
+					RepairSucceeded:   envelope.Repair.RepairSucceeded,
+					RepairExhausted:   envelope.Repair.RepairExhausted,
+					Summary:           summarizeValidationRepair(envelope.Repair, tr.Name),
+				})
+			}
+		}
+	}
+	return repairs
+}
+
+func extractLoopStatuses(msgs []*message.Message) []sessionShowLoop {
+	loops := make([]sessionShowLoop, 0)
+	for _, msg := range msgs {
+		for _, part := range msg.Parts {
+			tr, ok := part.(message.ToolResult)
+			if !ok || tr.Metadata == "" {
+				continue
+			}
+
+			var envelope sessionToolMetadataEnvelope
+			if err := json.Unmarshal([]byte(tr.Metadata), &envelope); err != nil || envelope.Loop == nil {
+				continue
+			}
+
+			loop := envelope.Loop
+			loops = append(loops, sessionShowLoop{
+				ToolCallID:          tr.ToolCallID,
+				ToolName:            cmp.Or(loop.ToolName, tr.Name),
+				NormalizedSignature: loop.NormalizedSignature,
+				Classification:      loop.Classification,
+				OutcomeClass:        loop.OutcomeClass,
+				LoopKind:            loop.LoopKind,
+				StreakCount:         loop.StreakCount,
+				SuggestedAction:     loop.SuggestedAction,
+				BlockedTool:         loop.BlockedTool,
+				Reason:              loop.Reason,
+				RecentToolCalls:     loop.RecentToolCalls,
+				RecentToolResults:   loop.RecentToolResults,
+				Summary:             summarizeLoop(loop, tr.Name),
+			})
+		}
+	}
+	return loops
+}
+
+func summarizeRuntimeRepair(repair sessionRepairMetadata, runtimeRepair *sessionRuntimeRepairStatus, toolName string) string {
+	if runtimeRepair == nil {
+		return ""
+	}
+
+	name := cmp.Or(repair.CanonicalToolName, repair.ResolvedToolName, runtimeRepair.OriginalToolName, toolName)
+	prefix := fmt.Sprintf("%s runtime failure observed", name)
+	if repair.AliasApplied {
+		prefix = fmt.Sprintf("%s alias rewritten from %s (%s)", name, cmp.Or(repair.RequestedToolName, repair.OriginalToolName), repair.AliasSource)
+	}
+	if runtimeRepair.AttemptCount > 0 {
+		prefix = fmt.Sprintf("%s repeated runtime failure observed", prefix)
+	}
+	if runtimeRepair.InitialFailure.FailureKind != "" {
+		prefix += fmt.Sprintf(" (%s)", runtimeRepair.InitialFailure.FailureKind)
+	}
+
+	parts := []string{prefix}
+	if runtimeRepair.AttemptCount > 0 {
+		parts = append(parts, "repair attempt started")
+	}
+	switch runtimeRepair.Outcome {
+	case "succeeded":
+		parts = append(parts, fmt.Sprintf("repair attempt succeeded after %d attempt(s)", runtimeRepair.AttemptCount))
+	case "exhausted":
+		summary := fmt.Sprintf("repair attempt exhausted after %d attempt(s)", runtimeRepair.AttemptCount)
+		if runtimeRepair.ExhaustedReason != "" {
+			summary += fmt.Sprintf(" (%s)", runtimeRepair.ExhaustedReason)
+		}
+		parts = append(parts, summary)
+	case "skipped":
+		summary := "repair skipped"
+		if runtimeRepair.ExhaustedReason != "" {
+			summary += fmt.Sprintf(" (%s)", runtimeRepair.ExhaustedReason)
+		}
+		parts = append(parts, summary)
+	}
+	return strings.Join(parts, "; ")
+}
+
+func summarizeValidationRepair(repair sessionRepairMetadata, toolName string) string {
+	requested := cmp.Or(repair.RequestedToolName, repair.OriginalToolName, toolName)
+	canonical := cmp.Or(repair.CanonicalToolName, repair.ResolvedToolName, toolName)
+
+	parts := make([]string, 0, 6)
+	switch repair.FailureKind {
+	case sessionRepairFailureKindAliasRewritten:
+		parts = append(parts, fmt.Sprintf("%s alias rewritten to %s (%s)", requested, canonical, repair.AliasSource))
+	case sessionRepairFailureKindInvalidToolName:
+		parts = append(parts, fmt.Sprintf("%s invalid tool name", requested))
+	case sessionRepairFailureKindInvalidSchema:
+		parts = append(parts, fmt.Sprintf("%s schema validation %s", canonical, repair.Outcome))
+	case "":
+		if repair.AliasApplied {
+			parts = append(parts, fmt.Sprintf("%s alias rewritten to %s (%s)", requested, canonical, repair.AliasSource))
+		} else {
+			parts = append(parts, fmt.Sprintf("%s validation %s", canonical, repair.Outcome))
+		}
+	default:
+		parts = append(parts, fmt.Sprintf("%s validation %s", canonical, repair.Outcome))
+	}
+	if repair.AliasApplied && repair.FailureKind != sessionRepairFailureKindAliasRewritten {
+		parts = append(parts, fmt.Sprintf("%s alias rewritten to %s (%s)", requested, canonical, repair.AliasSource))
+	}
+	if repair.FailureKind != "" &&
+		repair.FailureKind != sessionRepairFailureKindAliasRewritten &&
+		repair.FailureKind != sessionRepairFailureKindInvalidToolName &&
+		repair.FailureKind != sessionRepairFailureKindInvalidSchema {
+		parts = append(parts, repair.FailureKind)
+	}
+	if repair.AttemptCount > 0 {
+		parts = append(parts, fmt.Sprintf("repair attempted %d time(s)", repair.AttemptCount))
+	}
+	if repair.RepairSucceeded && repair.FailureKind != sessionRepairFailureKindAliasRewritten {
+		parts = append(parts, "repair succeeded")
+	}
+	if repair.RepairExhausted {
+		parts = append(parts, "repair exhausted")
+	}
+	if repair.Outcome == "skipped" {
+		parts = append(parts, "repair skipped")
+	}
+	if len(repair.Candidates) > 0 && repair.FailureKind == sessionRepairFailureKindInvalidToolName {
+		parts = append(parts, "candidates="+strings.Join(repair.Candidates, ", "))
+	}
+	if len(repair.Candidates) == 0 && len(repair.ExposedTools) > 0 && repair.FailureKind == sessionRepairFailureKindInvalidToolName {
+		parts = append(parts, "known="+strings.Join(repair.ExposedTools, ", "))
+	}
+	return strings.Join(parts, "; ")
+}
+
+func summarizeLoop(loop *sessionLoopMetadata, toolName string) string {
+	if loop == nil {
+		return ""
+	}
+
+	name := cmp.Or(loop.ToolName, toolName)
+	return fmt.Sprintf(
+		"%s repeated %d time(s); %s / %s; loop kind=%s; blocked=%t; supervisor handoff triggered=%t; suggested action=%s",
+		name,
+		loop.StreakCount,
+		loop.Classification,
+		loop.OutcomeClass,
+		loop.LoopKind,
+		loop.BlockedTool,
+		loop.SupervisorHandoffTriggered,
+		loop.SuggestedAction,
+	)
 }
 
 func shortSessionID(id string) string {
@@ -809,6 +1136,7 @@ func convertParts(parts []message.ContentPart) []sessionShowPart {
 				Content:    p.Content,
 				IsError:    p.IsError,
 				MIMEType:   p.MIMEType,
+				Metadata:   p.Metadata,
 			})
 		case message.BinaryContent:
 			result = append(result, sessionShowPart{

@@ -449,18 +449,23 @@ func TestValidateHooksNormalizesEventNames(t *testing.T) {
 		{"canonical", "PreToolUse", EventPreToolUse},
 		{"pre_turn", "PreTurn", EventPreTurn},
 		{"post_turn", "PostTurn", EventPostTurn},
+		{"post_tool_use", "PostToolUse", EventPostToolUse},
 		{"lowercase", "pretooluse", EventPreToolUse},
 		{"lowercase_pre_turn", "preturn", EventPreTurn},
 		{"lowercase_post_turn", "postturn", EventPostTurn},
+		{"lowercase_post_tool_use", "posttooluse", EventPostToolUse},
 		{"snake_case", "pre_tool_use", EventPreToolUse},
 		{"snake_case_pre_turn", "pre_turn", EventPreTurn},
 		{"snake_case_post_turn", "post_turn", EventPostTurn},
+		{"snake_case_post_tool_use", "post_tool_use", EventPostToolUse},
 		{"upper_snake", "PRE_TOOL_USE", EventPreToolUse},
 		{"upper_snake_pre_turn", "PRE_TURN", EventPreTurn},
 		{"upper_snake_post_turn", "POST_TURN", EventPostTurn},
+		{"upper_snake_post_tool_use", "POST_TOOL_USE", EventPostToolUse},
 		{"mixed_case", "preToolUse", EventPreToolUse},
 		{"mixed_case_pre_turn", "preTurn", EventPreTurn},
 		{"mixed_case_post_turn", "postTurn", EventPostTurn},
+		{"mixed_case_post_tool_use", "postToolUse", EventPostToolUse},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -518,6 +523,49 @@ func TestBuildPayloadAndEnvFromInput(t *testing.T) {
 	require.Equal(t, "qwen/qwen3.5-9b", envMap["CRUSH_MODEL"])
 	require.Equal(t, "view,grep", envMap["CRUSH_TOOL_CALLS"])
 	require.Equal(t, "1", envMap["CRUSH_NON_INTERACTIVE"])
+}
+
+func TestBuildPayloadAndEnvFromInput_PostToolUse(t *testing.T) {
+	t.Parallel()
+
+	exitCode := 127
+	retryable := true
+	input := EventInput{
+		SessionID:      "sess-1",
+		ToolName:       "bash",
+		ToolInputJSON:  `{"command":"cd C:\\projects\\missing && pwd"}`,
+		ToolCallID:     "tool-call-1",
+		ToolResultJSON: `{"tool_name":"bash","is_error":true}`,
+		MetadataJSON:   `{"repair":{"runtime":{"outcome":"succeeded"}}}`,
+		RepairJSON:     `{"runtime":{"outcome":"succeeded","failure_kind":"windows_path_translation_failure"}}`,
+		ExitCode:       &exitCode,
+		Retryable:      &retryable,
+		FailureKind:    "windows_path_translation_failure",
+	}
+
+	payload := string(BuildPayloadFromInput(EventPostToolUse, "C:/work", input))
+	require.Contains(t, payload, `"event":"PostToolUse"`)
+	require.Contains(t, payload, `"tool_call_id":"tool-call-1"`)
+	require.Contains(t, payload, `"tool_result":{"tool_name":"bash","is_error":true}`)
+	require.Contains(t, payload, `"exit_code":127`)
+	require.Contains(t, payload, `"retryable":true`)
+	require.Contains(t, payload, `"failure_kind":"windows_path_translation_failure"`)
+	require.Contains(t, payload, `"repair":{"runtime":{"outcome":"succeeded","failure_kind":"windows_path_translation_failure"}}`)
+
+	env := BuildEnvFromInput(EventPostToolUse, "C:/work", "C:/project", input)
+	envMap := make(map[string]string, len(env))
+	for _, kv := range env {
+		parts := strings.SplitN(kv, "=", 2)
+		if len(parts) == 2 {
+			envMap[parts[0]] = parts[1]
+		}
+	}
+	require.Equal(t, "tool-call-1", envMap["CRUSH_TOOL_CALL_ID"])
+	require.Equal(t, "127", envMap["CRUSH_EXIT_CODE"])
+	require.Equal(t, "true", envMap["CRUSH_RETRYABLE"])
+	require.Equal(t, "windows_path_translation_failure", envMap["CRUSH_FAILURE_KIND"])
+	require.Contains(t, envMap["CRUSH_TOOL_RESULT"], `"tool_name":"bash"`)
+	require.Contains(t, envMap["CRUSH_REPAIR"], `"failure_kind":"windows_path_translation_failure"`)
 }
 
 func TestRunnerParallelExecution(t *testing.T) {

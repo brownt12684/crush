@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"runtime"
 	"testing"
 
 	"charm.land/fantasy"
@@ -64,7 +65,7 @@ func TestBashTool_CustomAutoBackgroundThreshold(t *testing.T) {
 
 	resp := runBashTool(t, tool, ctx, BashParams{
 		Description:         "custom threshold",
-		Command:             "sleep 1.5 && echo done",
+		Command:             "i=0; while [ $i -lt 5000000 ]; do i=$((i+1)); done; echo done",
 		AutoBackgroundAfter: 1,
 	})
 
@@ -77,6 +78,77 @@ func TestBashTool_CustomAutoBackgroundThreshold(t *testing.T) {
 
 	bgManager := shell.GetBackgroundShellManager()
 	require.NoError(t, bgManager.Kill(meta.ShellID))
+}
+
+func TestBashTool_NonZeroExitReturnsStructuredError(t *testing.T) {
+	workingDir := t.TempDir()
+	tool := newBashToolForTest(workingDir)
+	ctx := context.WithValue(context.Background(), SessionIDContextKey, "test-session")
+
+	resp := runBashTool(t, tool, ctx, BashParams{
+		Description: "failing command",
+		Command:     `echo nope >&2; exit 1`,
+	})
+
+	require.True(t, resp.IsError)
+	var meta BashResponseMetadata
+	require.NoError(t, json.Unmarshal([]byte(resp.Metadata), &meta))
+	require.Equal(t, 1, meta.ExitCode)
+	require.Contains(t, meta.Stderr, "nope")
+	require.Equal(t, `echo nope >&2; exit 1`, meta.Command)
+	require.False(t, meta.Retryable)
+}
+
+func TestNormalizeBashInvocation_WindowsCDChain(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows-only normalization")
+	}
+
+	command, workingDir := normalizeBashInvocation(`cd C:\projects\foo && pwd`, `C:\base`)
+	require.Equal(t, "pwd", command)
+	require.Equal(t, `C:\projects\foo`, workingDir)
+}
+
+func TestNormalizeBashInvocation_WindowsExecutablePathWithSpaces(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows-only normalization")
+	}
+
+	command, workingDir := normalizeBashInvocation(`C:/Program Files/Python311/python.exe -m pip install pytest`, `C:\base`)
+	require.Equal(t, `"C:/Program Files/Python311/python.exe" -m pip install pytest`, command)
+	require.Equal(t, `C:\base`, workingDir)
+}
+
+func TestClassifyBashFailure_WindowsPathTranslation(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows-only classification")
+	}
+
+	retryable, failureKind := classifyBashFailure(
+		`cd C:\projects\missing && pwd`,
+		`C:\projects`,
+		"",
+		`C:projectsmissing: no such file or directory`,
+		nil,
+	)
+	require.True(t, retryable)
+	require.Equal(t, BashFailureKindWindowsPathTranslation, failureKind)
+}
+
+func TestClassifyBashFailure_WindowsExecutablePathWithSpaces(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows-only classification")
+	}
+
+	retryable, failureKind := classifyBashFailure(
+		`C:/Program Files/Python311/python.exe -m pip install pytest`,
+		`C:\projects`,
+		"not found",
+		"",
+		nil,
+	)
+	require.True(t, retryable)
+	require.Equal(t, BashFailureKindWindowsPathTranslation, failureKind)
 }
 
 func newBashToolForTest(workingDir string) fantasy.AgentTool {

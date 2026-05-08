@@ -904,6 +904,8 @@ func normalizeHookEvent(name string) string {
 		return "PreTurn"
 	case "postturn":
 		return "PostTurn"
+	case "posttooluse":
+		return "PostToolUse"
 	default:
 		return name
 	}

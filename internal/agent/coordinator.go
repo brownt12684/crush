@@ -617,6 +617,7 @@ func (c *coordinator) buildAgent(ctx context.Context, prompt *prompt.Prompt, age
 		SystemPrompt:         "",
 		PreTurnHooks:         buildHookRunner(c.cfg, hooks.EventPreTurn),
 		PostTurnHooks:        buildHookRunner(c.cfg, hooks.EventPostTurn),
+		PostToolUseHooks:     buildHookRunner(c.cfg, hooks.EventPostToolUse),
 		IsSubAgent:           isSubAgent,
 		DisableAutoSummarize: c.cfg.Config().Options.DisableAutoSummarize,
 		IsYolo:               c.permissions.SkipRequests(),

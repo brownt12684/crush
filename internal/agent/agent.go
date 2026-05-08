@@ -12,6 +12,7 @@ import (
 	"context"
 	_ "embed"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -45,6 +46,7 @@ import (
 	"github.com/charmbracelet/crush/internal/stringext"
 	"github.com/charmbracelet/crush/internal/version"
 	"github.com/charmbracelet/x/exp/charmtone"
+	"github.com/tidwall/sjson"
 )
 
 const (
@@ -54,6 +56,14 @@ const (
 	largeContextWindowThreshold = 200_000
 	largeContextWindowBuffer    = 20_000
 	smallContextWindowRatio     = 0.2
+)
+
+const (
+	sessionTitleModeEnv         = "CRUSH_SESSION_TITLE_MODE"
+	sessionTitleModeLLM         = "llm"
+	sessionTitleModePrompt      = "prompt"
+	sessionTitleModeOff         = "off"
+	derivedSessionTitleMaxChars = 80
 )
 
 var userAgent = fmt.Sprintf("Charm-Crush/%s (https://charm.land/crush)", version.Version)
@@ -105,6 +115,45 @@ func wrapInterruptedSessionPrompt(prompt string) string {
 	return interruptedSessionPromptPrefix + clean + "`"
 }
 
+func resolveSessionTitleMode() string {
+	mode := strings.ToLower(strings.TrimSpace(os.Getenv(sessionTitleModeEnv)))
+	switch mode {
+	case "", sessionTitleModeLLM:
+		return sessionTitleModeLLM
+	case sessionTitleModePrompt:
+		return sessionTitleModePrompt
+	case sessionTitleModeOff:
+		return sessionTitleModeOff
+	default:
+		return sessionTitleModeLLM
+	}
+}
+
+func deriveSessionTitleFromPrompt(prompt string) string {
+	text := unwrapInterruptedSessionPrompt(prompt)
+	text = strings.ReplaceAll(text, "\r\n", "\n")
+	lines := strings.Split(text, "\n")
+	var title string
+	for _, line := range lines {
+		candidate := strings.TrimSpace(line)
+		if candidate == "" {
+			continue
+		}
+		title = candidate
+		break
+	}
+	if title == "" {
+		return DefaultSessionName
+	}
+	title = strings.Join(strings.Fields(title), " ")
+	title = strings.Trim(title, "\"'` ")
+	title = cmp.Or(strings.TrimSpace(title), DefaultSessionName)
+	if len(title) > derivedSessionTitleMaxChars {
+		title = strings.TrimSpace(title[:derivedSessionTitleMaxChars]) + "…"
+	}
+	return title
+}
+
 type SessionAgent interface {
 	Run(context.Context, SessionAgentCall) (*fantasy.AgentResult, error)
 	SetModels(large Model, small Model)
@@ -135,6 +184,7 @@ type sessionAgent struct {
 	tools              *csync.Slice[fantasy.AgentTool]
 	preTurnHooks       *hooks.Runner
 	postTurnHooks      *hooks.Runner
+	postToolUseHooks   *hooks.Runner
 
 	isSubAgent           bool
 	sessions             session.Service
@@ -143,8 +193,10 @@ type sessionAgent struct {
 	isYolo               bool
 	notify               pubsub.Publisher[notify.Notification]
 
-	messageQueue   *csync.Map[string, []SessionAgentCall]
-	activeRequests *csync.Map[string, context.CancelFunc]
+	messageQueue     *csync.Map[string, []SessionAgentCall]
+	activeRequests   *csync.Map[string, context.CancelFunc]
+	toolRepairAudits *csync.Map[string, toolCallRepairAudit]
+	toolLoopTracker  *toolLoopTracker
 }
 
 type SessionAgentOptions struct {
@@ -154,6 +206,7 @@ type SessionAgentOptions struct {
 	SystemPrompt         string
 	PreTurnHooks         *hooks.Runner
 	PostTurnHooks        *hooks.Runner
+	PostToolUseHooks     *hooks.Runner
 	IsSubAgent           bool
 	DisableAutoSummarize bool
 	IsYolo               bool
@@ -173,6 +226,7 @@ func NewSessionAgent(
 		systemPrompt:         csync.NewValue(opts.SystemPrompt),
 		preTurnHooks:         opts.PreTurnHooks,
 		postTurnHooks:        opts.PostTurnHooks,
+		postToolUseHooks:     opts.PostToolUseHooks,
 		isSubAgent:           opts.IsSubAgent,
 		sessions:             opts.Sessions,
 		messages:             opts.Messages,
@@ -182,6 +236,8 @@ func NewSessionAgent(
 		notify:               opts.Notify,
 		messageQueue:         csync.NewMap[string, []SessionAgentCall](),
 		activeRequests:       csync.NewMap[string, context.CancelFunc](),
+		toolRepairAudits:     csync.NewMap[string, toolCallRepairAudit](),
+		toolLoopTracker:      newToolLoopTracker(),
 	}
 }
 
@@ -192,6 +248,7 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 	if call.SessionID == "" {
 		return nil, ErrSessionMissing
 	}
+	a.resetToolLoopTracker(call.SessionID)
 
 	// Queue the message if busy
 	if a.IsSessionBusy(call.SessionID) {
@@ -205,8 +262,8 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 	}
 
 	// Copy mutable fields under lock to avoid races with SetTools/SetModels.
-	agentTools := a.tools.Copy()
 	largeModel := a.largeModel.Get()
+	agentTools := wrapToolsWithRuntimeRepair(a.tools.Copy(), largeModel.Model, a.postToolUseHooks, a.toolRepairAudits, a.toolLoopTracker)
 	systemPrompt := a.systemPrompt.Get()
 	promptPrefix := a.systemPromptPrefix.Get()
 	var instructions strings.Builder
@@ -233,6 +290,7 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 	agent := fantasy.NewAgent(
 		largeModel.Model,
 		fantasy.WithSystemPrompt(systemPrompt),
+		fantasy.WithRepairToolCall(newToolCallRepairer(largeModel.Model, a.toolRepairAudits)),
 		fantasy.WithTools(agentTools...),
 		fantasy.WithUserAgent(userAgent),
 	)
@@ -249,12 +307,27 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 	}
 
 	var wg sync.WaitGroup
+	var toolResultMessagesMu sync.Mutex
+	toolResultMessages := make(map[string]message.Message)
+	stopForPreExecutionLoop := false
 	// Generate title if first message.
 	if len(msgs) == 0 {
 		titleCtx := ctx // Copy to avoid race with ctx reassignment below.
-		wg.Go(func() {
-			a.generateTitle(titleCtx, call.SessionID, call.Prompt)
-		})
+		switch resolveSessionTitleMode() {
+		case sessionTitleModeOff:
+			// Keep the default session title without additional work.
+		case sessionTitleModePrompt:
+			title := deriveSessionTitleFromPrompt(call.Prompt)
+			if title != "" && title != DefaultSessionName {
+				if err := a.sessions.Rename(titleCtx, call.SessionID, title); err != nil {
+					slog.Error("Failed to save prompt-derived session title", "error", err)
+				}
+			}
+		default:
+			wg.Go(func() {
+				a.generateTitle(titleCtx, call.SessionID, call.Prompt)
+			})
+		}
 	}
 	defer wg.Wait()
 
@@ -311,7 +384,7 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 			}
 
 			// Use latest tools (updated by SetTools when MCP tools change).
-			prepared.Tools = a.tools.Copy()
+			prepared.Tools = wrapToolsWithRuntimeRepair(a.tools.Copy(), largeModel.Model, a.postToolUseHooks, a.toolRepairAudits, a.toolLoopTracker)
 
 			queuedCalls, _ := a.messageQueue.Get(call.SessionID)
 			a.messageQueue.Del(call.SessionID)
@@ -347,6 +420,8 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 			if call.TurnSystemAppend != "" {
 				prepared.Messages = append([]fantasy.Message{fantasy.NewSystemMessage(call.TurnSystemAppend)}, prepared.Messages...)
 			}
+			callContext = withRuntimeToolMessages(callContext, prepared.Messages)
+			callContext = withRuntimeToolAvailableTools(callContext, prepared.Tools)
 
 			var assistantMsg message.Message
 			assistantMsg, err = a.messages.Create(callContext, call.SessionID, message.CreateMessageParams{
@@ -435,12 +510,17 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 			toolResult := a.convertToToolResult(result)
 			// Use parent ctx instead of genCtx to ensure the message is created
 			// even if the request is canceled mid-stream
-			_, createMsgErr := a.messages.Create(ctx, currentAssistant.SessionID, message.CreateMessageParams{
+			createdMsg, createMsgErr := a.messages.Create(ctx, currentAssistant.SessionID, message.CreateMessageParams{
 				Role: message.Tool,
 				Parts: []message.ContentPart{
 					toolResult,
 				},
 			})
+			if createMsgErr == nil && toolResult.ToolCallID != "" {
+				toolResultMessagesMu.Lock()
+				toolResultMessages[toolResult.ToolCallID] = createdMsg
+				toolResultMessagesMu.Unlock()
+			}
 			return createMsgErr
 		},
 		OnStepFinish: func(stepResult fantasy.StepResult) error {
@@ -464,6 +544,22 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 						break
 					}
 				}
+				triggered, handleErr := a.handlePreExecutionToolFailures(
+					ctx,
+					call.SessionID,
+					stepResult,
+					toolResultMessages,
+					&toolResultMessagesMu,
+				)
+				if handleErr != nil {
+					return handleErr
+				}
+				if triggered {
+					stopForPreExecutionLoop = true
+					finishReason = message.FinishReasonEndTurn
+				}
+			} else if len(stepResult.Content.ToolCalls()) == 0 && currentAssistant != nil {
+				a.resetToolLoopTrackerIfAssistantProgress(call.SessionID, currentAssistant.Content().Text)
 			}
 			currentAssistant.AddFinish(finishReason, "", "")
 			sessionLock.Lock()
@@ -505,6 +601,9 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 			},
 			func(steps []fantasy.StepResult) bool {
 				return hasRepeatedToolCalls(steps, loopDetectionWindowSize, loopDetectionMaxRepeats)
+			},
+			func(_ []fantasy.StepResult) bool {
+				return stopForPreExecutionLoop
 			},
 		},
 	})
@@ -551,6 +650,7 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 				}
 			}
 			if found {
+				a.toolRepairAudits.Del(tc.ID)
 				continue
 			}
 			content := "There was an error while executing the tool"
@@ -562,6 +662,9 @@ func (a *sessionAgent) Run(ctx context.Context, call SessionAgentCall) (*fantasy
 				Name:       tc.Name,
 				Content:    content,
 				IsError:    true,
+			}
+			if audit, ok := a.takeToolRepairAudit(tc.ID); ok {
+				toolResult.Metadata = mergeToolRepairMetadata(toolResult.Metadata, audit)
 			}
 			_, createErr = a.messages.Create(ctx, currentAssistant.SessionID, message.CreateMessageParams{
 				Role: message.Tool,
@@ -703,6 +806,191 @@ func (a *sessionAgent) runLifecycleHook(ctx context.Context, runner *hooks.Runne
 			"reason", result.Reason,
 		)
 	}
+}
+
+func (a *sessionAgent) resetToolLoopTracker(sessionID string) {
+	if a == nil || a.toolLoopTracker == nil || sessionID == "" {
+		return
+	}
+	a.toolLoopTracker.Reset(sessionID)
+}
+
+func (a *sessionAgent) resetToolLoopTrackerIfAssistantProgress(sessionID string, assistantText string) {
+	if a == nil || a.toolLoopTracker == nil || sessionID == "" {
+		return
+	}
+	a.toolLoopTracker.ResetIfSubstantiveAssistantProgress(sessionID, assistantText)
+}
+
+func (a *sessionAgent) handlePreExecutionToolFailures(
+	ctx context.Context,
+	sessionID string,
+	stepResult fantasy.StepResult,
+	toolResultMessages map[string]message.Message,
+	toolResultMessagesMu *sync.Mutex,
+) (bool, error) {
+	if a == nil || sessionID == "" {
+		return false, nil
+	}
+
+	resultsByID := make(map[string]fantasy.ToolResultContent, len(stepResult.Content.ToolResults()))
+	for _, result := range stepResult.Content.ToolResults() {
+		resultsByID[result.ToolCallID] = result
+	}
+
+	triggered := false
+	for _, toolCall := range stepResult.Content.ToolCalls() {
+		if !toolCall.Invalid || toolCall.ValidationError == nil {
+			continue
+		}
+
+		toolResult, ok := resultsByID[toolCall.ToolCallID]
+		if !ok {
+			continue
+		}
+
+		storedMessage, metadataJSON, foundMessage := storedToolResultMessage(toolCall.ToolCallID, toolResultMessages, toolResultMessagesMu)
+		a.runPostToolHookForInvalidToolCall(ctx, toolCall, toolResult, metadataJSON)
+
+		observation := classifyPreExecutionToolCycle(toolCall, toolResult, metadataJSON, sessionID)
+		handoff := observeToolCycle(a.toolLoopTracker, ctx, observation)
+		if handoff == nil || !foundMessage {
+			if handoff != nil {
+				triggered = true
+			}
+			continue
+		}
+
+		updatedMessage, changed := mergeLoopHandoffIntoToolResultMessage(storedMessage, toolCall.ToolCallID, *handoff)
+		if !changed {
+			triggered = true
+			continue
+		}
+		if err := a.messages.Update(ctx, updatedMessage); err != nil {
+			return true, err
+		}
+
+		toolResultMessagesMu.Lock()
+		toolResultMessages[toolCall.ToolCallID] = updatedMessage
+		toolResultMessagesMu.Unlock()
+		triggered = true
+	}
+
+	return triggered, nil
+}
+
+func (a *sessionAgent) runPostToolHookForInvalidToolCall(
+	ctx context.Context,
+	toolCall fantasy.ToolCallContent,
+	toolResult fantasy.ToolResultContent,
+	metadataJSON string,
+) {
+	if a == nil || a.postToolUseHooks == nil {
+		return
+	}
+
+	repairAudit, _ := toolRepairAuditFromMetadataJSON(metadataJSON)
+	failureKind := repairAudit.FailureKind
+	if failureKind == "" {
+		failureKind = validationFailureKind(toolCall.ValidationError)
+	}
+	retryable := repairAudit.Retryable
+
+	var (
+		retryablePtr *bool
+		repairJSON   string
+	)
+	retryablePtr = &retryable
+	if metadataAudit, ok := toolRepairAuditFromMetadataJSON(metadataJSON); ok {
+		if data, err := json.Marshal(metadataAudit); err == nil {
+			repairJSON = string(data)
+		}
+	}
+
+	resultJSON := toolResponseJSON(
+		toolCall.ToolCallID,
+		toolCall.ToolName,
+		fantasy.ToolResponse{
+			Type:     "text",
+			Content:  toolResultSummary(toolResult),
+			Metadata: metadataJSON,
+			IsError:  toolResultIsErrorContent(toolResult),
+			StopTurn: false,
+		},
+		metadataJSON,
+	)
+
+	result, err := a.postToolUseHooks.RunEvent(ctx, hooks.EventPostToolUse, hooks.EventInput{
+		SessionID:      tools.GetSessionFromContext(ctx),
+		ToolName:       toolCall.ToolName,
+		ToolInputJSON:  toolCall.Input,
+		ToolCallID:     toolCall.ToolCallID,
+		ToolResultJSON: resultJSON,
+		MetadataJSON:   metadataJSON,
+		Retryable:      retryablePtr,
+		FailureKind:    failureKind,
+		RepairJSON:     repairJSON,
+	})
+	if err != nil {
+		slog.Warn("Post-tool hook execution error", "tool", toolCall.ToolName, "error", err)
+		return
+	}
+	if result.Decision != hooks.DecisionNone || result.Halt || result.Reason != "" {
+		slog.Debug("Post-tool hook completed with decision",
+			"tool", toolCall.ToolName,
+			"decision", result.Decision.String(),
+			"halt", result.Halt,
+			"reason", result.Reason,
+		)
+	}
+}
+
+func storedToolResultMessage(
+	toolCallID string,
+	toolResultMessages map[string]message.Message,
+	toolResultMessagesMu *sync.Mutex,
+) (message.Message, string, bool) {
+	if toolCallID == "" || toolResultMessagesMu == nil {
+		return message.Message{}, "", false
+	}
+
+	toolResultMessagesMu.Lock()
+	defer toolResultMessagesMu.Unlock()
+
+	msg, ok := toolResultMessages[toolCallID]
+	if !ok {
+		return message.Message{}, "", false
+	}
+	for _, result := range msg.ToolResults() {
+		if result.ToolCallID == toolCallID {
+			return msg, result.Metadata, true
+		}
+	}
+	return message.Message{}, "", false
+}
+
+func mergeLoopHandoffIntoToolResultMessage(msg message.Message, toolCallID string, handoff toolLoopHandoff) (message.Message, bool) {
+	if toolCallID == "" {
+		return msg, false
+	}
+
+	changed := false
+	updatedParts := make([]message.ContentPart, 0, len(msg.Parts))
+	for _, part := range msg.Parts {
+		toolResult, ok := part.(message.ToolResult)
+		if ok && toolResult.ToolCallID == toolCallID {
+			toolResult.Metadata = mergeToolLoopMetadata(toolResult.Metadata, handoff)
+			updatedParts = append(updatedParts, toolResult)
+			changed = true
+			continue
+		}
+		updatedParts = append(updatedParts, part)
+	}
+	if !changed {
+		return msg, false
+	}
+	msg.Parts = updatedParts
+	return msg, true
 }
 
 func toolCallNames(msg *message.Message) []string {
@@ -890,10 +1178,15 @@ If not, please feel free to ignore. Again do not mention this message to the use
 	// without a result).
 	knownToolCallIDs := make(map[string]struct{})
 	knownToolResultIDs := make(map[string]struct{})
+	replayableAssistantCallsByMessageID := make(map[string][]message.ToolCall)
 	for _, m := range msgs {
 		switch m.Role {
 		case message.Assistant:
-			for _, tc := range m.ToolCalls() {
+			replayableToolCalls := replayableAssistantToolCalls(m)
+			if len(replayableToolCalls) > 0 {
+				replayableAssistantCallsByMessageID[m.ID] = replayableToolCalls
+			}
+			for _, tc := range replayableToolCalls {
 				knownToolCallIDs[tc.ID] = struct{}{}
 			}
 		case message.Tool:
@@ -907,23 +1200,29 @@ If not, please feel free to ignore. Again do not mention this message to the use
 		if len(m.Parts) == 0 {
 			continue
 		}
-		// Assistant message without content or tool calls (cancelled before it returned anything).
-		if m.Role == message.Assistant && len(m.ToolCalls()) == 0 && m.Content().Text == "" && m.ReasoningContent().String() == "" {
-			continue
-		}
 		if m.Role == message.Tool {
 			if msg, ok := filterOrphanedToolResults(m, knownToolCallIDs); ok {
 				history = append(history, msg)
 			}
 			continue
 		}
-		history = append(history, m.ToAIMessage()...)
-
 		if m.Role == message.Assistant {
-			if msg, ok := syntheticToolResultsForOrphanedCalls(m, knownToolResultIDs); ok {
+			replayableToolCalls := replayableAssistantCallsByMessageID[m.ID]
+			// Assistant message without content, reasoning, or replayable tool
+			// calls was interrupted before it emitted a usable turn.
+			if len(replayableToolCalls) == 0 && m.Content().Text == "" && m.ReasoningContent().String() == "" {
+				continue
+			}
+			sanitized := m.Clone()
+			sanitized.SetToolCalls(replayableToolCalls)
+			history = append(history, sanitized.ToAIMessage()...)
+
+			if msg, ok := syntheticToolResultsForOrphanedCalls(replayableToolCalls, knownToolResultIDs); ok {
 				history = append(history, msg)
 			}
+			continue
 		}
+		history = append(history, m.ToAIMessage()...)
 	}
 
 	var files []fantasy.FilePart
@@ -939,6 +1238,33 @@ If not, please feel free to ignore. Again do not mention this message to the use
 	}
 
 	return history, files
+}
+
+func replayableAssistantToolCalls(m message.Message) []message.ToolCall {
+	var replayable []message.ToolCall
+	for _, tc := range m.ToolCalls() {
+		if assistantToolCallIsReplayable(tc) {
+			replayable = append(replayable, tc)
+			continue
+		}
+		slog.Warn("Dropping malformed or unfinished assistant tool call from prompt replay",
+			"tool_call_id", tc.ID,
+			"tool_name", tc.Name,
+			"finished", tc.Finished,
+			"has_input", strings.TrimSpace(tc.Input) != "",
+		)
+	}
+	return replayable
+}
+
+func assistantToolCallIsReplayable(tc message.ToolCall) bool {
+	if strings.TrimSpace(tc.ID) == "" || strings.TrimSpace(tc.Name) == "" {
+		return false
+	}
+	if !tc.Finished {
+		return false
+	}
+	return strings.TrimSpace(tc.Input) != ""
 }
 
 // filterOrphanedToolResults converts a tool message to a fantasy.Message,
@@ -981,9 +1307,9 @@ func filterOrphanedToolResults(m message.Message, knownToolCallIDs map[string]st
 // session can leave orphaned tool_use blocks that permanently lock the
 // conversation. Returns the message and true if any synthetic results were
 // produced.
-func syntheticToolResultsForOrphanedCalls(m message.Message, knownToolResultIDs map[string]struct{}) (fantasy.Message, bool) {
+func syntheticToolResultsForOrphanedCalls(toolCalls []message.ToolCall, knownToolResultIDs map[string]struct{}) (fantasy.Message, bool) {
 	var syntheticParts []fantasy.MessagePart
-	for _, tc := range m.ToolCalls() {
+	for _, tc := range toolCalls {
 		if _, hasResult := knownToolResultIDs[tc.ID]; hasResult {
 			continue
 		}
@@ -1290,6 +1616,9 @@ func (a *sessionAgent) convertToToolResult(result fantasy.ToolResultContent) mes
 		Name:       result.ToolName,
 		Metadata:   result.ClientMetadata,
 	}
+	if audit, ok := a.takeToolRepairAudit(result.ToolCallID); ok {
+		baseResult.Metadata = mergeToolRepairMetadata(baseResult.Metadata, audit)
+	}
 
 	switch result.Result.GetType() {
 	case fantasy.ToolResultContentTypeText:
@@ -1323,6 +1652,30 @@ func (a *sessionAgent) convertToToolResult(result fantasy.ToolResultContent) mes
 	}
 
 	return baseResult
+}
+
+func mergeToolRepairMetadata(existing string, audit toolCallRepairAudit) string {
+	data, err := json.Marshal(audit)
+	if err != nil {
+		return existing
+	}
+
+	if existing == "" || !json.Valid([]byte(existing)) {
+		return `{"repair":` + string(data) + `}`
+	}
+
+	merged, err := sjson.SetRaw(existing, "repair", string(data))
+	if err != nil {
+		return existing
+	}
+	return merged
+}
+
+func (a *sessionAgent) takeToolRepairAudit(toolCallID string) (toolCallRepairAudit, bool) {
+	if a == nil || a.toolRepairAudits == nil {
+		return toolCallRepairAudit{}, false
+	}
+	return a.toolRepairAudits.Take(toolCallID)
 }
 
 // workaroundProviderMediaLimitations converts media content in tool results to

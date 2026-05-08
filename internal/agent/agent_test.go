@@ -26,6 +26,37 @@ func TestMain(m *testing.M) {
 	m.Run()
 }
 
+func TestResolveSessionTitleMode(t *testing.T) {
+	t.Setenv(sessionTitleModeEnv, "")
+	require.Equal(t, sessionTitleModeLLM, resolveSessionTitleMode())
+
+	t.Setenv(sessionTitleModeEnv, "prompt")
+	require.Equal(t, sessionTitleModePrompt, resolveSessionTitleMode())
+
+	t.Setenv(sessionTitleModeEnv, "off")
+	require.Equal(t, sessionTitleModeOff, resolveSessionTitleMode())
+
+	t.Setenv(sessionTitleModeEnv, "bogus")
+	require.Equal(t, sessionTitleModeLLM, resolveSessionTitleMode())
+}
+
+func TestDeriveSessionTitleFromPrompt(t *testing.T) {
+	t.Run("first non-empty line wins", func(t *testing.T) {
+		title := deriveSessionTitleFromPrompt("\n\n  Create a new local-first project from scratch  \nMore details follow")
+		require.Equal(t, "Create a new local-first project from scratch", title)
+	})
+
+	t.Run("unwraps interrupted prompt wrapper", func(t *testing.T) {
+		title := deriveSessionTitleFromPrompt(wrapInterruptedSessionPrompt("Resume the frontend validation pass"))
+		require.Equal(t, "Resume the frontend validation pass", title)
+	})
+
+	t.Run("falls back to default", func(t *testing.T) {
+		title := deriveSessionTitleFromPrompt(" \n \n ")
+		require.Equal(t, DefaultSessionName, title)
+	})
+}
+
 var modelPairs = []modelPair{
 	{"glm-5.1", hyperBuilder("glm-5.1"), hyperBuilder("gpt-oss-120b")},
 }
@@ -793,6 +824,63 @@ func TestPreparePrompt_OrphanedToolUseMixed(t *testing.T) {
 		}
 	}
 	require.Equal(t, 1, syntheticCount, "expected exactly one synthetic result for the orphaned call")
+}
+
+func TestPreparePrompt_DropsInterruptedMalformedToolCall(t *testing.T) {
+	env := testEnv(t)
+	sa := testSessionAgent(env, nil, nil, "test prompt")
+	agent := sa.(*sessionAgent)
+
+	ctx := t.Context()
+	sess, err := env.sessions.Create(ctx, "test")
+	require.NoError(t, err)
+
+	_, err = env.messages.Create(ctx, sess.ID, message.CreateMessageParams{
+		Role: message.User,
+		Parts: []message.ContentPart{
+			message.TextContent{Text: "hello"},
+		},
+	})
+	require.NoError(t, err)
+
+	// Simulate an interrupted tool call that was created in storage but never
+	// finished receiving its input or emitted a tool result.
+	_, err = env.messages.Create(ctx, sess.ID, message.CreateMessageParams{
+		Role: message.Assistant,
+		Parts: []message.ContentPart{
+			message.ToolCall{
+				ID:       "call_partial",
+				Name:     "write",
+				Input:    "",
+				Finished: false,
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	_, err = env.messages.Create(ctx, sess.ID, message.CreateMessageParams{
+		Role: message.User,
+		Parts: []message.ContentPart{
+			message.TextContent{Text: "continue"},
+		},
+	})
+	require.NoError(t, err)
+
+	msgs, err := env.messages.List(ctx, sess.ID)
+	require.NoError(t, err)
+
+	history, _ := agent.preparePrompt(msgs)
+
+	for _, msg := range history {
+		for _, part := range msg.Content {
+			if tc, ok := fantasy.AsMessagePart[fantasy.ToolCallPart](part); ok {
+				require.NotEqual(t, "call_partial", tc.ToolCallID, "interrupted tool call should not be replayed")
+			}
+			if tr, ok := fantasy.AsMessagePart[fantasy.ToolResultPart](part); ok {
+				require.NotEqual(t, "call_partial", tr.ToolCallID, "interrupted tool call should not produce a synthetic result")
+			}
+		}
+	}
 }
 
 func TestProviderRetryLogFields(t *testing.T) {

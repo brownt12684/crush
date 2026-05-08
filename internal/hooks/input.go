@@ -25,6 +25,8 @@ type Payload struct {
 	CWD               string          `json:"cwd"`
 	ToolName          string          `json:"tool_name,omitempty"`
 	ToolInput         json.RawMessage `json:"tool_input,omitempty"`
+	ToolCallID        string          `json:"tool_call_id,omitempty"`
+	ToolResult        json.RawMessage `json:"tool_result,omitempty"`
 	Prompt            string          `json:"prompt,omitempty"`
 	AssistantResponse string          `json:"assistant_response,omitempty"`
 	FinishReason      string          `json:"finish_reason,omitempty"`
@@ -34,6 +36,10 @@ type Payload struct {
 	DurationMS        int64           `json:"duration_ms,omitempty"`
 	NonInteractive    bool            `json:"non_interactive,omitempty"`
 	ToolCalls         []string        `json:"tool_calls,omitempty"`
+	ExitCode          *int            `json:"exit_code,omitempty"`
+	Retryable         *bool           `json:"retryable,omitempty"`
+	FailureKind       string          `json:"failure_kind,omitempty"`
+	Repair            json.RawMessage `json:"repair,omitempty"`
 	Metadata          json.RawMessage `json:"metadata,omitempty"`
 }
 
@@ -42,6 +48,8 @@ type EventInput struct {
 	SessionID         string
 	ToolName          string
 	ToolInputJSON     string
+	ToolCallID        string
+	ToolResultJSON    string
 	Prompt            string
 	AssistantResponse string
 	FinishReason      string
@@ -49,9 +57,13 @@ type EventInput struct {
 	Provider          string
 	Error             string
 	MetadataJSON      string
+	RepairJSON        string
 	DurationMS        int64
 	NonInteractive    bool
 	ToolCalls         []string
+	ExitCode          *int
+	Retryable         *bool
+	FailureKind       string
 }
 
 // BuildPayload constructs the JSON stdin payload for a hook command.
@@ -74,6 +86,14 @@ func BuildPayloadFromInput(eventName, cwd string, input EventInput) []byte {
 	if json.Valid([]byte(input.MetadataJSON)) {
 		metadata = json.RawMessage(input.MetadataJSON)
 	}
+	var toolResult json.RawMessage
+	if json.Valid([]byte(input.ToolResultJSON)) {
+		toolResult = json.RawMessage(input.ToolResultJSON)
+	}
+	var repair json.RawMessage
+	if json.Valid([]byte(input.RepairJSON)) {
+		repair = json.RawMessage(input.RepairJSON)
+	}
 
 	p := Payload{
 		Event:             eventName,
@@ -81,6 +101,8 @@ func BuildPayloadFromInput(eventName, cwd string, input EventInput) []byte {
 		CWD:               cwd,
 		ToolName:          input.ToolName,
 		ToolInput:         toolInput,
+		ToolCallID:        input.ToolCallID,
+		ToolResult:        toolResult,
 		Prompt:            input.Prompt,
 		AssistantResponse: input.AssistantResponse,
 		FinishReason:      input.FinishReason,
@@ -90,6 +112,10 @@ func BuildPayloadFromInput(eventName, cwd string, input EventInput) []byte {
 		DurationMS:        input.DurationMS,
 		NonInteractive:    input.NonInteractive,
 		ToolCalls:         input.ToolCalls,
+		ExitCode:          input.ExitCode,
+		Retryable:         input.Retryable,
+		FailureKind:       input.FailureKind,
+		Repair:            repair,
 		Metadata:          metadata,
 	}
 	data, err := json.Marshal(p)
@@ -150,6 +176,24 @@ func BuildEnvFromInput(eventName, cwd, projectDir string, input EventInput) []st
 	}
 	if input.MetadataJSON != "" {
 		env = append(env, fmt.Sprintf("CRUSH_METADATA=%s", input.MetadataJSON))
+	}
+	if input.ToolCallID != "" {
+		env = append(env, fmt.Sprintf("CRUSH_TOOL_CALL_ID=%s", input.ToolCallID))
+	}
+	if input.ToolResultJSON != "" {
+		env = append(env, fmt.Sprintf("CRUSH_TOOL_RESULT=%s", input.ToolResultJSON))
+	}
+	if input.ExitCode != nil {
+		env = append(env, fmt.Sprintf("CRUSH_EXIT_CODE=%d", *input.ExitCode))
+	}
+	if input.Retryable != nil {
+		env = append(env, fmt.Sprintf("CRUSH_RETRYABLE=%t", *input.Retryable))
+	}
+	if input.FailureKind != "" {
+		env = append(env, fmt.Sprintf("CRUSH_FAILURE_KIND=%s", input.FailureKind))
+	}
+	if input.RepairJSON != "" {
+		env = append(env, fmt.Sprintf("CRUSH_REPAIR=%s", input.RepairJSON))
 	}
 
 	// Extract tool-specific env vars from the JSON input.
