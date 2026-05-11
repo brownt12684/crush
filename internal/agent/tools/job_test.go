@@ -2,10 +2,12 @@ package tools
 
 import (
 	"context"
+	"encoding/json"
 	"runtime"
 	"testing"
 	"time"
 
+	"charm.land/fantasy"
 	"github.com/charmbracelet/crush/internal/shell"
 	"github.com/stretchr/testify/require"
 )
@@ -279,6 +281,41 @@ func TestBackgroundShell_List(t *testing.T) {
 	for _, sh := range shells {
 		bgManager.Kill(sh.ID)
 	}
+}
+
+func TestJobOutputTool_WaitReturnsForLongRunningBackgroundJob(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	ctx := context.Background()
+
+	bgManager := shell.GetBackgroundShellManager()
+	bgShell, err := bgManager.Start(ctx, workingDir, nil, `python -c "import time; time.sleep(5)"`, "long running")
+	require.NoError(t, err)
+	defer bgManager.Kill(bgShell.ID)
+
+	params := JobOutputParams{
+		ShellID: bgShell.ID,
+		Wait:    true,
+	}
+	input, err := json.Marshal(params)
+	require.NoError(t, err)
+
+	call := fantasy.ToolCall{
+		ID:    "job-output-test",
+		Name:  JobOutputToolName,
+		Input: string(input),
+	}
+
+	tool := NewJobOutputTool()
+	start := time.Now()
+	resp, err := tool.Run(ctx, call)
+	require.NoError(t, err)
+	elapsed := time.Since(start)
+
+	require.False(t, resp.IsError)
+	require.Contains(t, resp.Content, "Status: running")
+	require.Less(t, elapsed, 4*time.Second)
 }
 
 func TestBackgroundShell_AutoBackground(t *testing.T) {

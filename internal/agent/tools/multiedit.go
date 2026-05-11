@@ -257,7 +257,7 @@ func processMultiEditExistingFile(edit editContext, params MultiEditParams, call
 	}
 
 	// Check if file was read before editing
-	lastRead := edit.filetracker.LastReadTime(edit.ctx, sessionID, params.FilePath)
+	lastRead := effectiveLastReadTime(edit.ctx, sessionID, params.FilePath, fileInfo, edit.filetracker, edit.files)
 	if lastRead.IsZero() {
 		return fantasy.NewTextErrorResponse("you must read the file before editing it. Use the View tool first"), nil
 	}

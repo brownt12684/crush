@@ -104,3 +104,15 @@ func TestRepairToolCallAliases(t *testing.T) {
 	require.NoError(t, err)
 	require.Nil(t, unmodified)
 }
+
+func TestResolveToolCallName_ReadMCPResourceDeprecatedAlias(t *testing.T) {
+	t.Parallel()
+
+	available := []fantasy.AgentTool{
+		toolpkg.NewReadMCPResourceTool(nil, nil),
+	}
+
+	got, ok := resolveToolCallName("run_mcp_resource", available)
+	require.True(t, ok)
+	require.Equal(t, toolpkg.ReadMCPResourceToolName, got)
+}

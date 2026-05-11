@@ -205,7 +205,7 @@ func deleteContent(edit editContext, filePath, oldString string, replaceAll bool
 		return fantasy.ToolResponse{}, fmt.Errorf("session ID is required for deleting content")
 	}
 
-	lastRead := edit.filetracker.LastReadTime(edit.ctx, sessionID, filePath)
+	lastRead := effectiveLastReadTime(edit.ctx, sessionID, filePath, fileInfo, edit.filetracker, edit.files)
 	if lastRead.IsZero() {
 		return fantasy.NewTextErrorResponse("you must read the file before editing it. Use the View tool first"), nil
 	}
@@ -336,7 +336,7 @@ func replaceContent(edit editContext, filePath, oldString, newString string, rep
 		return fantasy.ToolResponse{}, fmt.Errorf("session ID is required for edit a file")
 	}
 
-	lastRead := edit.filetracker.LastReadTime(edit.ctx, sessionID, filePath)
+	lastRead := effectiveLastReadTime(edit.ctx, sessionID, filePath, fileInfo, edit.filetracker, edit.files)
 	if lastRead.IsZero() {
 		return fantasy.NewTextErrorResponse("you must read the file before editing it. Use the View tool first"), nil
 	}

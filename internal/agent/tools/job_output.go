@@ -5,13 +5,16 @@ import (
 	_ "embed"
 	"fmt"
 	"strings"
+	"time"
 
 	"charm.land/fantasy"
 	"github.com/charmbracelet/crush/internal/shell"
 )
 
 const (
-	JobOutputToolName = "job_output"
+	JobOutputToolName           = "job_output"
+	defaultJobOutputWaitTimeout = 2 * time.Second
+	jobOutputPollInterval       = 100 * time.Millisecond
 )
 
 //go:embed job_output.md
@@ -45,11 +48,7 @@ func NewJobOutputTool() fantasy.AgentTool {
 				return fantasy.NewTextErrorResponse(fmt.Sprintf("background shell not found: %s", params.ShellID)), nil
 			}
 
-			if params.Wait {
-				bgShell.WaitContext(ctx)
-			}
-
-			stdout, stderr, done, err := bgShell.GetOutput()
+			stdout, stderr, done, err := waitForJobOutput(ctx, bgShell, params.Wait)
 
 			var outputParts []string
 			if stdout != "" {
@@ -87,4 +86,33 @@ func NewJobOutputTool() fantasy.AgentTool {
 			result := fmt.Sprintf("Status: %s\n\n%s", status, output)
 			return fantasy.WithResponseMetadata(fantasy.NewTextResponse(result), metadata), nil
 		})
+}
+
+func waitForJobOutput(ctx context.Context, bgShell *shell.BackgroundShell, wait bool) (string, string, bool, error) {
+	stdout, stderr, done, err := bgShell.GetOutput()
+	if !wait || done {
+		return stdout, stderr, done, err
+	}
+
+	initialStdout := stdout
+	initialStderr := stderr
+
+	timer := time.NewTimer(defaultJobOutputWaitTimeout)
+	defer timer.Stop()
+	ticker := time.NewTicker(jobOutputPollInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return bgShell.GetOutput()
+		case <-timer.C:
+			return bgShell.GetOutput()
+		case <-ticker.C:
+			stdout, stderr, done, err = bgShell.GetOutput()
+			if done || stdout != initialStdout || stderr != initialStderr {
+				return stdout, stderr, done, err
+			}
+		}
+	}
 }

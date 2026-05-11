@@ -204,7 +204,7 @@ func (t *toolLoopTracker) Observe(
 }
 
 func (t *toolLoopTracker) ShouldBlockMetaToolCall(sessionID string, call fantasy.ToolCall) bool {
-	if t == nil || t.states == nil || sessionID == "" || !isHardGatedMetaProbeTool(call.Name) {
+	if t == nil || t.states == nil || sessionID == "" || !isHardGatedMetaProbeCall(call) {
 		return false
 	}
 
@@ -217,7 +217,7 @@ func (t *toolLoopTracker) ShouldBlockMetaToolCall(sessionID string, call fantasy
 	if !strings.EqualFold(strings.TrimSpace(last.ToolName), strings.TrimSpace(call.Name)) {
 		return false
 	}
-	if last.NormalizedInput != normalizeToolCallInput(call.Input) {
+	if last.NormalizedInput != normalizeToolLoopInput(call.Name, call.Input) {
 		return false
 	}
 	return last.OutcomeClass == toolCycleOutcomeSuccessLowSignal
@@ -245,7 +245,7 @@ func classifyToolCycle(
 		ToolCallID:      call.ID,
 		ToolName:        strings.TrimSpace(call.Name),
 		ToolInput:       call.Input,
-		NormalizedInput: normalizeToolCallInput(call.Input),
+		NormalizedInput: normalizeToolLoopInput(call.Name, call.Input),
 		ProgressSignals: nil,
 		ResultSummary:   strings.TrimSpace(resp.Content),
 		ResultIsError:   resp.IsError,
@@ -283,7 +283,7 @@ func classifyPreExecutionToolCycle(
 		ToolCallID:      toolCall.ToolCallID,
 		ToolName:        strings.TrimSpace(toolCall.ToolName),
 		ToolInput:       toolCall.Input,
-		NormalizedInput: normalizeToolCallInput(toolCall.Input),
+		NormalizedInput: normalizeToolLoopInput(toolCall.ToolName, toolCall.Input),
 		ProgressSignals: []string{"no_progress_detected"},
 		ResultSummary:   toolResultSummary(toolResult),
 		ResultIsError:   toolResultIsErrorContent(toolResult),
@@ -325,7 +325,6 @@ func (o *toolCycleObservation) classifySuccess(call fantasy.ToolCall, resp fanta
 		o.ProgressSignals = []string{"low_signal_probe", "meta_tool_probe"}
 	case tools.CrushLogsToolName,
 		tools.ListMCPResourcesToolName,
-		tools.ReadMCPResourceToolName,
 		tools.JobOutputToolName,
 		tools.ViewToolName,
 		tools.LSToolName,
@@ -339,6 +338,13 @@ func (o *toolCycleObservation) classifySuccess(call fantasy.ToolCall, resp fanta
 		tools.SourcegraphToolName:
 		o.OutcomeClass = toolCycleOutcomeSuccessLowSignal
 		o.ProgressSignals = []string{"read_only_probe"}
+	case tools.ReadMCPResourceToolName:
+		o.OutcomeClass = toolCycleOutcomeSuccessLowSignal
+		if isCrushSkillProbeInput(call.Input) {
+			o.ProgressSignals = []string{"low_signal_probe", "meta_tool_probe"}
+		} else {
+			o.ProgressSignals = []string{"read_only_probe"}
+		}
 	case tools.WriteToolName:
 		o.OutcomeClass = toolCycleOutcomeSuccessProgressing
 		o.ProgressSignals = extractWriteProgressSignals(resp.Metadata)
@@ -644,7 +650,7 @@ func summarizeToolLoopText(text string) string {
 }
 
 func deriveLoopKind(classification toolLoopClassification, observation toolCycleObservation) toolLoopKind {
-	if isMetaProbeToolName(observation.ToolName) {
+	if observationIsMetaProbe(observation) {
 		return toolLoopKindRepeatedMetaToolProbe
 	}
 
@@ -810,7 +816,7 @@ func buildMetaToolGuardResponse(call fantasy.ToolCall) fantasy.ToolResponse {
 	resp := fantasy.NewTextErrorResponse(reason)
 	resp.Metadata = mergeToolLoopGuardMetadata(resp.Metadata, toolLoopGuardMetadata{
 		ToolName:        strings.TrimSpace(call.Name),
-		NormalizedInput: normalizeToolCallInput(call.Input),
+		NormalizedInput: normalizeToolLoopInput(call.Name, call.Input),
 		LoopKind:        toolLoopKindRepeatedMetaToolProbe,
 		BlockedTool:     true,
 		Reason:          reason,
@@ -849,10 +855,55 @@ func toolLoopGuardMetadataFromJSON(metadata string) (toolLoopGuardMetadata, bool
 	return *envelope.Guard, true
 }
 
-func isHardGatedMetaProbeTool(name string) bool {
-	return strings.EqualFold(strings.TrimSpace(name), tools.CrushInfoToolName)
+func isHardGatedMetaProbeCall(call fantasy.ToolCall) bool {
+	return strings.EqualFold(strings.TrimSpace(call.Name), tools.CrushInfoToolName) ||
+		(stringsEqualFold(call.Name, tools.ReadMCPResourceToolName) && isCrushSkillProbeInput(call.Input))
 }
 
-func isMetaProbeToolName(name string) bool {
-	return strings.EqualFold(strings.TrimSpace(name), tools.CrushInfoToolName)
+func observationIsMetaProbe(observation toolCycleObservation) bool {
+	if stringsEqualFold(observation.ToolName, tools.CrushInfoToolName) {
+		return true
+	}
+	return slices.Contains(observation.ProgressSignals, "meta_tool_probe") ||
+		slices.Contains(observation.ProgressSignals, string(toolLoopKindRepeatedMetaToolProbe))
+}
+
+func normalizeToolLoopInput(toolName string, input string) string {
+	if stringsEqualFold(toolName, tools.ReadMCPResourceToolName) {
+		if normalized, ok := normalizeCrushSkillProbeInput(input); ok {
+			return normalized
+		}
+	}
+	return normalizeToolCallInput(input)
+}
+
+func isCrushSkillProbeInput(input string) bool {
+	_, ok := normalizeCrushSkillProbeInput(input)
+	return ok
+}
+
+func normalizeCrushSkillProbeInput(input string) (string, bool) {
+	type readMCPResourceInput struct {
+		MCPName string `json:"mcp_name"`
+		URI     string `json:"uri"`
+	}
+
+	var params readMCPResourceInput
+	if err := json.Unmarshal([]byte(input), &params); err != nil {
+		return "", false
+	}
+
+	uri := strings.TrimSpace(params.URI)
+	if !strings.HasPrefix(strings.ToLower(uri), "crush://skills/") {
+		return "", false
+	}
+
+	normalized, err := json.Marshal(map[string]string{
+		"mcp_name": strings.ToLower(strings.TrimSpace(params.MCPName)),
+		"uri":      "crush://skills/*/SKILL.md",
+	})
+	if err != nil {
+		return "", false
+	}
+	return string(normalized), true
 }

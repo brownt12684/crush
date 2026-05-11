@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -43,6 +44,9 @@ const (
 	toolFailureKindRepeatedInvalidTool = "repeated_invalid_tool_loop"
 	toolFailureKindRepeatedSchemaLoop  = "repeated_invalid_schema_loop"
 	toolFailureKindRepeatedRuntimeLoop = "repeated_retryable_runtime_loop"
+
+	toolAliasSourceBuiltinSkillURI = "builtin_skill_uri"
+	toolAliasSourceLocalFileURI    = "local_file_uri"
 )
 
 type toolCallRepairConfig struct {
@@ -208,6 +212,12 @@ func repairToolCall(
 	if targetToolName != "" && targetToolName != current.ToolName {
 		current.ToolName = targetToolName
 	}
+	inputNormalized := false
+	normalizedInput := deterministicallyNormalizeToolCallInput(current.Input, targetTool)
+	if normalizedInput != current.Input {
+		current.Input = normalizedInput
+		inputNormalized = true
+	}
 
 	requiredFields, missingFields := requiredAndMissingFields(current.Input, targetTool)
 	audit.RequiredFields = requiredFields
@@ -217,6 +227,8 @@ func repairToolCall(
 	if currentValidationErr == nil {
 		if audit.AliasApplied {
 			audit.FailureKind = toolFailureKindAliasRewritten
+		} else if inputNormalized {
+			audit.FailureKind = toolFailureKindInvalidSchema
 		}
 		audit.RepairedToolName = current.ToolName
 		audit.RepairedInput = current.Input
@@ -368,6 +380,8 @@ func resolveRepairTargetTool(name string, availableTools []fantasy.AgentTool) (f
 }
 
 func requiredAndMissingFields(input string, tool fantasy.AgentTool) ([]string, []string) {
+	input = deterministicallyNormalizeToolCallInput(input, tool)
+
 	required := append([]string(nil), tool.Info().Required...)
 	if len(required) == 0 {
 		return nil, nil
@@ -575,8 +589,10 @@ func repairFunctionTool(tool fantasy.AgentTool) fantasy.FunctionTool {
 }
 
 func validateToolCallAgainstSchema(toolCall fantasy.ToolCallContent, tool fantasy.AgentTool) error {
+	normalizedInput := deterministicallyNormalizeToolCallInput(toolCall.Input, tool)
+
 	var obj any
-	if err := json.Unmarshal([]byte(toolCall.Input), &obj); err != nil {
+	if err := json.Unmarshal([]byte(normalizedInput), &obj); err != nil {
 		return fmt.Errorf("invalid JSON input: %w", err)
 	}
 
@@ -588,6 +604,276 @@ func validateToolCallAgainstSchema(toolCall fantasy.ToolCallContent, tool fantas
 		return err
 	}
 	return nil
+}
+
+func deterministicallyNormalizeToolCallInput(input string, tool fantasy.AgentTool) string {
+	if tool == nil {
+		return input
+	}
+
+	info := tool.Info()
+	if len(info.Parameters) == 0 {
+		return input
+	}
+
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(input), &obj); err != nil {
+		return input
+	}
+
+	changed := false
+	for fieldName, schemaValue := range info.Parameters {
+		expectedType, ok := schemaTypeName(schemaValue)
+		if !ok || (expectedType != "array" && expectedType != "object") {
+			continue
+		}
+
+		rawValue, ok := obj[fieldName]
+		if !ok {
+			continue
+		}
+
+		normalizedRaw, normalized := normalizeJSONStringStructuredValue(rawValue, expectedType)
+		if !normalized {
+			continue
+		}
+		obj[fieldName] = normalizedRaw
+		changed = true
+	}
+
+	if !changed {
+		return input
+	}
+
+	normalizedInput, err := json.Marshal(obj)
+	if err != nil {
+		return input
+	}
+	return string(normalizedInput)
+}
+
+func deterministicallyRewritePreExecutionToolCall(
+	call fantasy.ToolCall,
+	availableTools []fantasy.AgentTool,
+) (fantasy.ToolCall, fantasy.AgentTool, *toolCallRepairAudit, bool) {
+	resolution := resolveToolName(call.Name, availableTools)
+	if resolution.CanonicalToolName == tools.BashToolName {
+		targetTool, _, ok := resolveRepairTargetTool(tools.BashToolName, availableTools)
+		if !ok {
+			return fantasy.ToolCall{}, nil, nil, false
+		}
+
+		rewritten, changed := deterministicallyRewriteBashToolCall(call)
+		if !changed {
+			return fantasy.ToolCall{}, nil, nil, false
+		}
+
+		audit := &toolCallRepairAudit{
+			FeatureEnabled:    true,
+			RequestedToolName: call.Name,
+			OriginalToolName:  call.Name,
+			OriginalInput:     call.Input,
+			CanonicalToolName: resolution.CanonicalToolName,
+			ResolvedToolName:  resolution.CanonicalToolName,
+			FailureKind:       toolFailureKindRetryableRuntime,
+			RepairedToolName:  rewritten.Name,
+			RepairedInput:     rewritten.Input,
+		}
+		return rewritten, targetTool, audit, true
+	}
+
+	if resolution.CanonicalToolName != tools.ReadMCPResourceToolName {
+		return fantasy.ToolCall{}, nil, nil, false
+	}
+
+	filePath, aliasSource, ok := viewFilePathFromReadMCPResourceInput(call.Input)
+	if !ok {
+		return fantasy.ToolCall{}, nil, nil, false
+	}
+
+	targetTool, targetResolution, ok := resolveRepairTargetTool(tools.ViewToolName, availableTools)
+	if !ok {
+		return fantasy.ToolCall{}, nil, nil, false
+	}
+
+	rewrittenInput, err := json.Marshal(map[string]any{
+		"file_path": filePath,
+	})
+	if err != nil {
+		return fantasy.ToolCall{}, nil, nil, false
+	}
+
+	rewritten := call
+	rewritten.Name = targetResolution.CanonicalToolName
+	rewritten.Input = string(rewrittenInput)
+
+	audit := &toolCallRepairAudit{
+		FeatureEnabled:    true,
+		RequestedToolName: call.Name,
+		OriginalToolName:  call.Name,
+		OriginalInput:     call.Input,
+		CanonicalToolName: targetResolution.CanonicalToolName,
+		ResolvedToolName:  targetResolution.CanonicalToolName,
+		AliasApplied:      true,
+		AliasSource:       aliasSource,
+		FailureKind:       toolFailureKindAliasRewritten,
+		RepairedToolName:  rewritten.Name,
+		RepairedInput:     rewritten.Input,
+	}
+	return rewritten, targetTool, audit, true
+}
+
+func deterministicallyRewriteBashToolCall(call fantasy.ToolCall) (fantasy.ToolCall, bool) {
+	var params tools.BashParams
+	if err := json.Unmarshal([]byte(call.Input), &params); err != nil {
+		return fantasy.ToolCall{}, false
+	}
+
+	repairedCommand, changed := stripUnsupportedWindowsOutputPipe(params.Command)
+	if !changed {
+		return fantasy.ToolCall{}, false
+	}
+	params.Command = repairedCommand
+
+	encoded, err := json.Marshal(params)
+	if err != nil {
+		return fantasy.ToolCall{}, false
+	}
+
+	rewritten := call
+	rewritten.Input = string(encoded)
+	return rewritten, true
+}
+
+func builtinSkillURIFromReadMCPResourceInput(input string) (string, bool) {
+	var params struct {
+		URI string `json:"uri"`
+	}
+	if err := json.Unmarshal([]byte(input), &params); err != nil {
+		return "", false
+	}
+	uri := strings.TrimSpace(params.URI)
+	if !strings.HasPrefix(strings.ToLower(uri), "crush://skills/") {
+		return "", false
+	}
+	return uri, true
+}
+
+func viewFilePathFromReadMCPResourceInput(input string) (string, string, bool) {
+	if filePath, ok := builtinSkillURIFromReadMCPResourceInput(input); ok {
+		return filePath, toolAliasSourceBuiltinSkillURI, true
+	}
+
+	var params struct {
+		URI string `json:"uri"`
+	}
+	if err := json.Unmarshal([]byte(input), &params); err != nil {
+		return "", "", false
+	}
+
+	filePath := normalizeLocalFileURI(strings.TrimSpace(params.URI))
+	if !looksLikeLocalFilePath(filePath) {
+		return "", "", false
+	}
+	return filePath, toolAliasSourceLocalFileURI, true
+}
+
+func normalizeLocalFileURI(uri string) string {
+	if !strings.HasPrefix(strings.ToLower(uri), "file://") {
+		return uri
+	}
+
+	trimmed := strings.TrimPrefix(strings.TrimPrefix(strings.TrimPrefix(uri, "file:///"), "file://"), "FILE://")
+	if len(trimmed) >= 3 && trimmed[0] == '/' && trimmed[2] == ':' {
+		return trimmed[1:]
+	}
+	return trimmed
+}
+
+func looksLikeLocalFilePath(uri string) bool {
+	if uri == "" {
+		return false
+	}
+	lower := strings.ToLower(uri)
+	if strings.HasPrefix(lower, "crush://") {
+		return false
+	}
+	if strings.Contains(uri, "://") {
+		return false
+	}
+	if filepath.IsAbs(uri) {
+		return true
+	}
+	if strings.HasPrefix(uri, "./") || strings.HasPrefix(uri, "../") || strings.HasPrefix(uri, `.\`) || strings.HasPrefix(uri, `..\`) {
+		return true
+	}
+	if strings.HasPrefix(uri, `\\`) {
+		return true
+	}
+	if strings.ContainsAny(uri, `/\`) && strings.Contains(filepath.Base(uri), ".") {
+		return true
+	}
+	return false
+}
+
+func schemaTypeName(schemaValue any) (string, bool) {
+	switch schema := schemaValue.(type) {
+	case map[string]any:
+		value, ok := schema["type"]
+		if !ok {
+			return "", false
+		}
+		typeName, ok := value.(string)
+		if !ok {
+			return "", false
+		}
+		return strings.ToLower(strings.TrimSpace(typeName)), typeName != ""
+	case map[string]string:
+		typeName, ok := schema["type"]
+		if !ok {
+			return "", false
+		}
+		typeName = strings.ToLower(strings.TrimSpace(typeName))
+		return typeName, typeName != ""
+	default:
+		return "", false
+	}
+}
+
+func normalizeJSONStringStructuredValue(rawValue json.RawMessage, expectedType string) (json.RawMessage, bool) {
+	var stringValue string
+	if err := json.Unmarshal(rawValue, &stringValue); err != nil {
+		return nil, false
+	}
+
+	stringValue = strings.TrimSpace(stringValue)
+	if stringValue == "" {
+		return nil, false
+	}
+
+	var parsed any
+	if err := json.Unmarshal([]byte(stringValue), &parsed); err != nil {
+		return nil, false
+	}
+
+	switch expectedType {
+	case "array":
+		if _, ok := parsed.([]any); !ok {
+			return nil, false
+		}
+	case "object":
+		if _, ok := parsed.(map[string]any); !ok {
+			return nil, false
+		}
+	default:
+		return nil, false
+	}
+
+	normalized, err := json.Marshal(parsed)
+	if err != nil {
+		return nil, false
+	}
+	return normalized, true
 }
 
 func repairSchemaForTool(tool fantasy.AgentTool) (fantasyschema.Schema, error) {

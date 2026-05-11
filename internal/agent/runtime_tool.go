@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"regexp"
 	"strings"
 
 	"charm.land/fantasy"
@@ -96,7 +97,25 @@ func (t *runtimeRepairTool) SetProviderOptions(opts fantasy.ProviderOptions) {
 	t.inner.SetProviderOptions(opts)
 }
 
+func (t *runtimeRepairTool) ToolAliases() []string {
+	return tools.ToolAliases(t.inner)
+}
+
+func (t *runtimeRepairTool) DeprecatedToolAliases() []string {
+	return tools.DeprecatedToolAliases(t.inner)
+}
+
 func (t *runtimeRepairTool) Run(ctx context.Context, call fantasy.ToolCall) (fantasy.ToolResponse, error) {
+	if rewrittenCall, audit, rewritten := t.canonicalizeToolAlias(ctx, call); rewritten {
+		recordValidationToolCallRepairAudit(t.audits, call.ID, audit, toolCallRepairOutcomeSucceeded, "")
+		call = rewrittenCall
+	}
+
+	if rewrittenCall, targetTool, audit, rewritten := deterministicallyRewritePreExecutionToolCall(call, runtimeToolAvailableToolsFromContext(ctx)); rewritten {
+		recordValidationToolCallRepairAudit(t.audits, call.ID, audit, toolCallRepairOutcomeSucceeded, "")
+		return targetTool.Run(ctx, rewrittenCall)
+	}
+
 	if resp, blocked := t.blockRepeatedMetaToolCall(ctx, call); blocked {
 		finalResp := t.applyRepeatedLoopGuard(ctx, call, call, resp)
 		t.runPostToolHook(ctx, call, call, finalResp)
@@ -118,6 +137,39 @@ func (t *runtimeRepairTool) Run(ctx context.Context, call fantasy.ToolCall) (fan
 
 	t.runPostToolHook(ctx, call, finalCall, finalResp)
 	return finalResp, nil
+}
+
+func (t *runtimeRepairTool) canonicalizeToolAlias(
+	ctx context.Context,
+	call fantasy.ToolCall,
+) (fantasy.ToolCall, *toolCallRepairAudit, bool) {
+	availableTools := runtimeToolAvailableToolsFromContext(ctx)
+	if len(availableTools) == 0 {
+		availableTools = []fantasy.AgentTool{t.inner}
+	}
+	resolution := resolveToolName(call.Name, availableTools)
+	if resolution.CanonicalToolName == "" || strings.EqualFold(resolution.CanonicalToolName, call.Name) {
+		return fantasy.ToolCall{}, nil, false
+	}
+
+	rewritten := call
+	rewritten.Name = resolution.CanonicalToolName
+	audit := &toolCallRepairAudit{
+		FeatureEnabled:    true,
+		RequestedToolName: call.Name,
+		OriginalToolName:  call.Name,
+		OriginalInput:     call.Input,
+		CanonicalToolName: resolution.CanonicalToolName,
+		ResolvedToolName:  resolution.CanonicalToolName,
+		AliasApplied:      resolution.AliasApplied,
+		AliasSource:       resolution.AliasSource,
+		Candidates:        resolution.Candidates,
+		ExposedTools:      resolution.ExposedTools,
+		FailureKind:       toolFailureKindAliasRewritten,
+		RepairedToolName:  rewritten.Name,
+		RepairedInput:     rewritten.Input,
+	}
+	return rewritten, audit, true
 }
 
 func (t *runtimeRepairTool) blockRepeatedMetaToolCall(
@@ -384,6 +436,12 @@ func deterministicExecutionFailureRepair(
 
 	repairedCommand, changed := stripUnsupportedWindowsOutputPipe(params.Command)
 	if !changed {
+		repairedCommand, changed = rewriteUnsupportedWindowsGrepCommand(
+			params.Command,
+			failure,
+		)
+	}
+	if !changed {
 		return fantasy.ToolCallContent{}, false
 	}
 	params.Command = repairedCommand
@@ -421,6 +479,26 @@ func stripUnsupportedWindowsOutputPipe(command string) (string, bool) {
 		return repaired, true
 	}
 	return command, false
+}
+
+var unsupportedWindowsGrepPattern = regexp.MustCompile(`(?i)(^|[|;&(]\s*)grep(\s+)`)
+
+func rewriteUnsupportedWindowsGrepCommand(
+	command string,
+	failure toolExecutionFailureDetails,
+) (string, bool) {
+	loweredFailure := strings.ToLower(strings.Join([]string{failure.Stderr, failure.Content}, "\n"))
+	if !strings.Contains(loweredFailure, `"grep": executable file not found in $path`) {
+		return command, false
+	}
+	if !unsupportedWindowsGrepPattern.MatchString(command) {
+		return command, false
+	}
+	repaired := unsupportedWindowsGrepPattern.ReplaceAllString(command, `${1}rg${2}`)
+	if repaired == command {
+		return command, false
+	}
+	return repaired, true
 }
 
 func (t *runtimeRepairTool) runPostToolHook(

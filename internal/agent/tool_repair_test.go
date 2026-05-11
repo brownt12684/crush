@@ -128,6 +128,61 @@ func (t *crushInfoSpyTool) Run(_ context.Context, call fantasy.ToolCall) (fantas
 func (t *crushInfoSpyTool) ProviderOptions() fantasy.ProviderOptions   { return nil }
 func (t *crushInfoSpyTool) SetProviderOptions(fantasy.ProviderOptions) {}
 
+type readMCPResourceSpyTool struct {
+	callCount int
+	lastCall  fantasy.ToolCall
+	content   string
+}
+
+func (t *readMCPResourceSpyTool) Info() fantasy.ToolInfo {
+	return fantasy.ToolInfo{
+		Name:        toolpkg.ReadMCPResourceToolName,
+		Description: "Read an MCP resource.",
+		Parameters: map[string]any{
+			"mcp_name": map[string]any{"type": "string"},
+			"uri":      map[string]any{"type": "string"},
+		},
+		Required: []string{"mcp_name", "uri"},
+	}
+}
+
+func (t *readMCPResourceSpyTool) Run(_ context.Context, call fantasy.ToolCall) (fantasy.ToolResponse, error) {
+	t.callCount++
+	t.lastCall = call
+	return fantasy.NewTextResponse(t.content), nil
+}
+
+func (t *readMCPResourceSpyTool) ProviderOptions() fantasy.ProviderOptions   { return nil }
+func (t *readMCPResourceSpyTool) SetProviderOptions(fantasy.ProviderOptions) {}
+
+type viewSpyTool struct {
+	callCount int
+	lastCall  fantasy.ToolCall
+	content   string
+}
+
+func (t *viewSpyTool) Info() fantasy.ToolInfo {
+	return fantasy.ToolInfo{
+		Name:        toolpkg.ViewToolName,
+		Description: "Read a file or builtin skill.",
+		Parameters: map[string]any{
+			"file_path": map[string]any{"type": "string"},
+			"offset":    map[string]any{"type": "integer"},
+			"limit":     map[string]any{"type": "integer"},
+		},
+		Required: []string{"file_path"},
+	}
+}
+
+func (t *viewSpyTool) Run(_ context.Context, call fantasy.ToolCall) (fantasy.ToolResponse, error) {
+	t.callCount++
+	t.lastCall = call
+	return fantasy.NewTextResponse(t.content), nil
+}
+
+func (t *viewSpyTool) ProviderOptions() fantasy.ProviderOptions   { return nil }
+func (t *viewSpyTool) SetProviderOptions(fantasy.ProviderOptions) {}
+
 func TestToolCallRepair_RepairsMissingFilePath(t *testing.T) {
 	t.Setenv(toolCallRepairEnabledEnv, "true")
 	t.Setenv(toolCallRepairMaxAttemptsEnv, "2")
@@ -268,6 +323,69 @@ func TestToolCallRepair_AliasRewriteRecordsCanonicalizationMetadata(t *testing.T
 	require.True(t, audit.RepairSucceeded)
 	require.False(t, audit.RepairAttempted)
 	require.Equal(t, "write", audit.RepairedToolName)
+}
+
+func TestRuntimeToolRepair_CanonicalizesAliasBeforeExecution(t *testing.T) {
+	t.Parallel()
+
+	spy := &writeSpyTool{}
+	tool := toolpkg.WithAliases(spy, []string{"write_file"}, nil)
+	audits := csync.NewMap[string, toolCallRepairAudit]()
+	wrapped := newRuntimeRepairTool(tool, nil, nil, audits, nil, toolCallRepairConfigFromEnv())
+	ctx := context.WithValue(context.Background(), toolpkg.SessionIDContextKey, "sess-1")
+	ctx = withRuntimeToolAvailableTools(ctx, []fantasy.AgentTool{wrapped})
+
+	resp, err := wrapped.Run(ctx, fantasy.ToolCall{
+		ID:    "call-1",
+		Name:  "write_file",
+		Input: `{"file_path":"notes.txt","content":"hello"}`,
+	})
+	require.NoError(t, err)
+	require.False(t, resp.IsError)
+	require.Equal(t, 1, spy.callCount)
+	require.Equal(t, "write", spy.lastCall.Name)
+	assertJSONEq(t, `{"file_path":"notes.txt","content":"hello"}`, spy.lastCall.Input)
+
+	audit, ok := audits.Get("call-1")
+	require.True(t, ok)
+	require.Equal(t, "write_file", audit.RequestedToolName)
+	require.Equal(t, "write", audit.CanonicalToolName)
+	require.True(t, audit.AliasApplied)
+	require.Equal(t, string(toolAliasSourceExplicitAlias), audit.AliasSource)
+	require.Equal(t, toolFailureKindAliasRewritten, audit.FailureKind)
+	require.Equal(t, toolCallRepairOutcomeSucceeded, audit.Outcome)
+}
+
+func TestToolCallRepair_DeterministicallyNormalizesJSONStringStructuredInput(t *testing.T) {
+	t.Parallel()
+
+	tool := toolpkg.NewMultiEditTool(nil, nil, nil, nil, "")
+	audits := csync.NewMap[string, toolCallRepairAudit]()
+
+	repaired, err := repairToolCall(context.Background(), nil, toolCallRepairConfig{
+		Enabled:         true,
+		MaxAttempts:     defaultToolCallRepairMaxAttempts,
+		MaxOutputTokens: defaultToolCallRepairMaxOutput,
+	}, audits, fantasy.ToolCallRepairOptions{
+		OriginalToolCall: fantasy.ToolCallContent{
+			ToolCallID: "call-1",
+			ToolName:   toolpkg.MultiEditToolName,
+			Input:      `{"file_path":"notes.txt","edits":"[{\"old_string\":\"before\",\"new_string\":\"after\"}]"}`,
+		},
+		ValidationError: errors.New("invalid parameters: json: cannot unmarshal string into Go struct field MultiEditParams.edits of type []tools.MultiEditOperation"),
+		AvailableTools:  []fantasy.AgentTool{tool},
+	})
+	require.NoError(t, err)
+	require.NotNil(t, repaired)
+	require.Equal(t, toolpkg.MultiEditToolName, repaired.ToolName)
+	assertJSONEq(t, `{"file_path":"notes.txt","edits":[{"old_string":"before","new_string":"after"}]}`, repaired.Input)
+
+	audit, ok := audits.Get("call-1")
+	require.True(t, ok)
+	require.Equal(t, toolCallRepairOutcomeSucceeded, audit.Outcome)
+	require.Equal(t, toolFailureKindInvalidSchema, audit.FailureKind)
+	require.False(t, audit.RepairAttempted)
+	assertJSONEq(t, `{"file_path":"notes.txt","edits":[{"old_string":"before","new_string":"after"}]}`, audit.RepairedInput)
 }
 
 func TestToolCallRepair_InvalidUnknownToolRecordsStructuredFailure(t *testing.T) {
@@ -618,18 +736,106 @@ func TestRuntimeToolRepair_StripsUnsupportedWindowsOutputPipeDeterministically(t
 	})
 	require.NoError(t, err)
 	require.False(t, resp.IsError)
-	require.Equal(t, 2, tool.callCount)
+	require.Equal(t, 1, tool.callCount)
 	require.NotContains(t, tool.lastCall.Input, "head")
 	require.NotContains(t, tool.lastCall.Input, "Select-Object")
 
 	audit, ok := audits.Get("call-1")
 	require.True(t, ok)
-	require.NotNil(t, audit.Runtime)
-	require.Equal(t, toolCallRepairOutcomeSucceeded, audit.Runtime.Outcome)
-	require.Equal(t, toolpkg.BashFailureKindWindowsShellMismatch, audit.Runtime.InitialFailure.FailureKind)
-	require.Equal(t, 1, audit.Runtime.AttemptCount)
-	require.NotContains(t, audit.Runtime.RepairedInput, "head")
-	require.NotContains(t, audit.Runtime.RepairedInput, "Select-Object")
+	require.Equal(t, toolCallRepairOutcomeSucceeded, audit.Outcome)
+	require.Equal(t, toolFailureKindRetryableRuntime, audit.FailureKind)
+	require.NotContains(t, audit.RepairedInput, "head")
+	require.NotContains(t, audit.RepairedInput, "Select-Object")
+}
+
+func TestRuntimeToolRepair_RewritesUnsupportedWindowsOutputPipeBeforeExecution(t *testing.T) {
+	t.Setenv(toolCallRepairEnabledEnv, "true")
+	t.Setenv(toolCallRepairMaxAttemptsEnv, "2")
+
+	tool := &bashRuntimeSpyTool{
+		runFunc: func(call fantasy.ToolCall) fantasy.ToolResponse {
+			require.NotContains(t, call.Input, "| head")
+			require.NotContains(t, call.Input, "Select-Object")
+			return fantasy.NewTextResponse("ok")
+		},
+	}
+
+	audits := csync.NewMap[string, toolCallRepairAudit]()
+	wrapped := newRuntimeRepairTool(tool, nil, nil, audits, nil, toolCallRepairConfigFromEnv())
+	ctx := withRuntimeToolAvailableTools(
+		withRuntimeToolMessages(
+			context.WithValue(context.Background(), toolpkg.SessionIDContextKey, "sess-1"),
+			[]fantasy.Message{fantasy.NewUserMessage("run the command")},
+		),
+		[]fantasy.AgentTool{tool},
+	)
+
+	resp, err := wrapped.Run(ctx, fantasy.ToolCall{
+		ID:    "call-1",
+		Name:  toolpkg.BashToolName,
+		Input: `{"description":"Run backend tests","command":"cd C:\\projects\\repo && python -m pytest tests/test_api.py -v 2>&1 | head -100"}`,
+	})
+	require.NoError(t, err)
+	require.False(t, resp.IsError)
+	require.Equal(t, 1, tool.callCount)
+	require.NotContains(t, tool.lastCall.Input, "| head")
+
+	audit, ok := audits.Get("call-1")
+	require.True(t, ok)
+	require.Equal(t, toolCallRepairOutcomeSucceeded, audit.Outcome)
+	require.Equal(t, toolFailureKindRetryableRuntime, audit.FailureKind)
+	require.NotContains(t, audit.RepairedInput, "| head")
+}
+
+func TestRuntimeToolRepair_RewritesUnsupportedWindowsGrepBeforeExecution(t *testing.T) {
+	t.Setenv(toolCallRepairEnabledEnv, "true")
+	t.Setenv(toolCallRepairMaxAttemptsEnv, "2")
+
+	tool := &bashRuntimeSpyTool{
+		runFunc: func(call fantasy.ToolCall) fantasy.ToolResponse {
+			if strings.Contains(call.Input, "grep ") {
+				return fantasy.WithResponseMetadata(
+					fantasy.NewTextErrorResponse("shell mismatch"),
+					toolpkg.BashResponseMetadata{
+						Command:          `npm run build 2>&1 | grep -i error`,
+						WorkingDirectory: `C:\workspace\frontend`,
+						ExitCode:         127,
+						Stdout:           "",
+						Stderr:           `"grep": executable file not found in $PATH`,
+						Retryable:        true,
+						FailureKind:      toolpkg.BashFailureKindWindowsShellMismatch,
+					},
+				)
+			}
+			require.Contains(t, call.Input, "rg -i error")
+			return fantasy.NewTextResponse("fixed")
+		},
+	}
+
+	audits := csync.NewMap[string, toolCallRepairAudit]()
+	wrapped := newRuntimeRepairTool(tool, nil, nil, audits, nil, toolCallRepairConfigFromEnv())
+	ctx := withRuntimeToolAvailableTools(
+		withRuntimeToolMessages(
+			context.WithValue(context.Background(), toolpkg.SessionIDContextKey, "sess-1"),
+			[]fantasy.Message{fantasy.NewUserMessage("run the command")},
+		),
+		[]fantasy.AgentTool{tool},
+	)
+
+	resp, err := wrapped.Run(ctx, fantasy.ToolCall{
+		ID:    "call-grep",
+		Name:  toolpkg.BashToolName,
+		Input: `{"description":"Inspect build output","command":"npm run build 2>&1 | grep -i error"}`,
+	})
+	require.NoError(t, err)
+	require.False(t, resp.IsError)
+	require.Equal(t, 2, tool.callCount)
+	require.NotContains(t, tool.lastCall.Input, "grep ")
+	require.Contains(t, tool.lastCall.Input, "rg -i error")
+
+	audit, ok := audits.Get("call-grep")
+	require.True(t, ok)
+	require.True(t, audit.Runtime != nil || audit.RepairedInput != "")
 }
 
 func TestRuntimeToolRepair_RepeatedCrushInfoBlockedAndEscalates(t *testing.T) {
@@ -697,6 +903,166 @@ func TestRuntimeToolRepair_RepeatedCrushInfoBlockedAndEscalates(t *testing.T) {
 	require.Equal(t, string(toolLoopSuggestedActionRequestSupervisor), thirdMetadata.Loop.SuggestedAction)
 	require.True(t, thirdMetadata.Loop.BlockedTool)
 	require.True(t, strings.HasPrefix(thirdMetadata.Loop.NormalizedSignature, "sha256:"))
+}
+
+func TestRuntimeToolRepair_RepeatedMissingSkillProbeBlockedAndEscalates(t *testing.T) {
+	t.Parallel()
+
+	tool := &readMCPResourceSpyTool{
+		content: "# Crush Skill Not Found\n\nNo local built-in Crush skill matched `crush-hooks`.\nUse the `crush_info` tool inside Crush for the authoritative active-skill list.\n",
+	}
+	tracker := newToolLoopTracker()
+	wrapped := newRuntimeRepairTool(tool, nil, nil, nil, tracker, toolCallRepairConfigFromEnv())
+	ctx := context.WithValue(context.Background(), toolpkg.SessionIDContextKey, "sess-1")
+
+	firstCall := fantasy.ToolCall{
+		ID:    "call-1",
+		Name:  toolpkg.ReadMCPResourceToolName,
+		Input: `{"mcp_name":"stack-orchestrator","uri":"crush://skills/crush-hooks/SKILL.md"}`,
+	}
+	secondCall := fantasy.ToolCall{
+		ID:    "call-2",
+		Name:  toolpkg.ReadMCPResourceToolName,
+		Input: `{"mcp_name":"stack-orchestrator","uri":"crush://skills/jq/SKILL.md"}`,
+	}
+	thirdCall := fantasy.ToolCall{
+		ID:    "call-3",
+		Name:  toolpkg.ReadMCPResourceToolName,
+		Input: `{"mcp_name":"stack-orchestrator","uri":"crush://skills/another/SKILL.md"}`,
+	}
+
+	first, err := wrapped.Run(ctx, firstCall)
+	require.NoError(t, err)
+	require.False(t, first.IsError)
+	require.False(t, first.StopTurn)
+	require.Equal(t, 1, tool.callCount)
+
+	second, err := wrapped.Run(ctx, secondCall)
+	require.NoError(t, err)
+	require.True(t, second.IsError)
+	require.False(t, second.StopTurn)
+	require.Equal(t, 1, tool.callCount)
+	require.Contains(t, second.Content, "Repeated read_mcp_resource call blocked")
+
+	var secondMetadata struct {
+		Guard struct {
+			ToolName        string `json:"tool_name"`
+			NormalizedInput string `json:"normalized_input"`
+			LoopKind        string `json:"loop_kind"`
+			BlockedTool     bool   `json:"blocked_tool"`
+		} `json:"guard"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(second.Metadata), &secondMetadata))
+	require.Equal(t, toolpkg.ReadMCPResourceToolName, secondMetadata.Guard.ToolName)
+	require.Equal(t, `{"mcp_name":"stack-orchestrator","uri":"crush://skills/*/SKILL.md"}`, secondMetadata.Guard.NormalizedInput)
+	require.Equal(t, string(toolLoopKindRepeatedMetaToolProbe), secondMetadata.Guard.LoopKind)
+	require.True(t, secondMetadata.Guard.BlockedTool)
+
+	third, err := wrapped.Run(ctx, thirdCall)
+	require.NoError(t, err)
+	require.True(t, third.IsError)
+	require.True(t, third.StopTurn)
+	require.Equal(t, 1, tool.callCount)
+
+	var thirdMetadata struct {
+		Loop struct {
+			ToolName            string `json:"tool_name"`
+			Classification      string `json:"classification"`
+			OutcomeClass        string `json:"outcome_class"`
+			LoopKind            string `json:"loop_kind"`
+			StreakCount         int    `json:"streak_count"`
+			SuggestedAction     string `json:"suggested_action"`
+			BlockedTool         bool   `json:"blocked_tool"`
+			NormalizedSignature string `json:"normalized_signature"`
+		} `json:"loop"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(third.Metadata), &thirdMetadata))
+	require.Equal(t, toolpkg.ReadMCPResourceToolName, thirdMetadata.Loop.ToolName)
+	require.Equal(t, string(toolLoopClassificationRepeatedLowSignalSuccess), thirdMetadata.Loop.Classification)
+	require.Equal(t, string(toolCycleOutcomeSuccessLowSignal), thirdMetadata.Loop.OutcomeClass)
+	require.Equal(t, string(toolLoopKindRepeatedMetaToolProbe), thirdMetadata.Loop.LoopKind)
+	require.Equal(t, 3, thirdMetadata.Loop.StreakCount)
+	require.Equal(t, string(toolLoopSuggestedActionRequestSupervisor), thirdMetadata.Loop.SuggestedAction)
+	require.True(t, thirdMetadata.Loop.BlockedTool)
+	require.True(t, strings.HasPrefix(thirdMetadata.Loop.NormalizedSignature, "sha256:"))
+}
+
+func TestRuntimeToolRepair_RewritesBuiltinSkillReadMCPResourceToView(t *testing.T) {
+	t.Parallel()
+
+	readTool := &readMCPResourceSpyTool{
+		content: "read should not run",
+	}
+	viewTool := &viewSpyTool{
+		content: "# Skill Contents",
+	}
+	audits := csync.NewMap[string, toolCallRepairAudit]()
+	readWrapped := newRuntimeRepairTool(readTool, nil, nil, audits, nil, toolCallRepairConfigFromEnv())
+	viewWrapped := newRuntimeRepairTool(viewTool, nil, nil, audits, nil, toolCallRepairConfigFromEnv())
+
+	ctx := context.WithValue(context.Background(), toolpkg.SessionIDContextKey, "sess-1")
+	ctx = withRuntimeToolAvailableTools(ctx, []fantasy.AgentTool{readWrapped, viewWrapped})
+
+	resp, err := readWrapped.Run(ctx, fantasy.ToolCall{
+		ID:    "call-1",
+		Name:  toolpkg.ReadMCPResourceToolName,
+		Input: `{"mcp_name":"stack-orchestrator","uri":"crush://skills/crush-hooks/SKILL.md"}`,
+	})
+	require.NoError(t, err)
+	require.False(t, resp.IsError)
+	require.Equal(t, 0, readTool.callCount)
+	require.Equal(t, 1, viewTool.callCount)
+	require.Equal(t, toolpkg.ViewToolName, viewTool.lastCall.Name)
+	assertJSONEq(t, `{"file_path":"crush://skills/crush-hooks/SKILL.md"}`, viewTool.lastCall.Input)
+
+	audit, ok := audits.Get("call-1")
+	require.True(t, ok)
+	require.Equal(t, toolpkg.ReadMCPResourceToolName, audit.RequestedToolName)
+	require.Equal(t, toolpkg.ViewToolName, audit.CanonicalToolName)
+	require.True(t, audit.AliasApplied)
+	require.Equal(t, toolAliasSourceBuiltinSkillURI, audit.AliasSource)
+	require.Equal(t, toolFailureKindAliasRewritten, audit.FailureKind)
+	require.Equal(t, toolCallRepairOutcomeSucceeded, audit.Outcome)
+	assertJSONEq(t, `{"file_path":"crush://skills/crush-hooks/SKILL.md"}`, audit.RepairedInput)
+}
+
+func TestRuntimeToolRepair_RewritesLocalFileReadMCPResourceToView(t *testing.T) {
+	t.Parallel()
+
+	readTool := &readMCPResourceSpyTool{
+		content: "read should not run",
+	}
+	viewTool := &viewSpyTool{
+		content: "package backend",
+	}
+	audits := csync.NewMap[string, toolCallRepairAudit]()
+	readWrapped := newRuntimeRepairTool(readTool, nil, nil, audits, nil, toolCallRepairConfigFromEnv())
+	viewWrapped := newRuntimeRepairTool(viewTool, nil, nil, audits, nil, toolCallRepairConfigFromEnv())
+
+	ctx := context.WithValue(context.Background(), toolpkg.SessionIDContextKey, "sess-1")
+	ctx = withRuntimeToolAvailableTools(ctx, []fantasy.AgentTool{readWrapped, viewWrapped})
+
+	resp, err := readWrapped.Run(ctx, fantasy.ToolCall{
+		ID:    "call-1",
+		Name:  toolpkg.ReadMCPResourceToolName,
+		Input: `{"mcp_name":"stack-orchestrator","uri":"C:/workspace/backend/src/__init__.py"}`,
+	})
+	require.NoError(t, err)
+	require.False(t, resp.IsError)
+	require.Equal(t, 0, readTool.callCount)
+	require.Equal(t, 1, viewTool.callCount)
+	require.Equal(t, toolpkg.ViewToolName, viewTool.lastCall.Name)
+	assertJSONEq(t, `{"file_path":"C:/workspace/backend/src/__init__.py"}`, viewTool.lastCall.Input)
+
+	audit, ok := audits.Get("call-1")
+	require.True(t, ok)
+	require.Equal(t, toolpkg.ReadMCPResourceToolName, audit.RequestedToolName)
+	require.Equal(t, toolpkg.ViewToolName, audit.CanonicalToolName)
+	require.True(t, audit.AliasApplied)
+	require.Equal(t, toolAliasSourceLocalFileURI, audit.AliasSource)
+	require.Equal(t, toolFailureKindAliasRewritten, audit.FailureKind)
+	require.Equal(t, toolCallRepairOutcomeSucceeded, audit.Outcome)
+	assertJSONEq(t, `{"file_path":"C:/workspace/backend/src/__init__.py"}`, audit.RepairedInput)
 }
 
 func toolCallResponse(id, toolName, input string, finishReason fantasy.FinishReason) *fantasy.Response {
