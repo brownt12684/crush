@@ -153,7 +153,6 @@ func bashDescription(attribution *config.Attribution, modelID string, blocked []
 func blockFuncs(blocked []string) []shell.BlockFunc {
 	return nil
 }
-}
 
 // NewBashTool returns the bash tool. Every shell it starts is tagged with
 // shellOwner, so the owner can stop them with

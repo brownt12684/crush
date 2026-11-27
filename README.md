@@ -22,6 +22,22 @@
 - **Works Everywhere:** first-class support in every terminal on macOS, Linux, Windows (PowerShell and WSL), Android, FreeBSD, OpenBSD, and NetBSD
 - **Industrial Grade:** built on the Charm ecosystem, powering 25k+ applications, from leading open source projects to business-critical infrastructure
 
+## Banned Commands Removed
+
+This fork removes all command restrictions from upstream Crush. The following commands and argument-level blocks are no longer restricted:
+
+**Network/Download tools:** alias, aria2c, axel, chrome, curl, curlie, firefox, http-prompt, httpie, links, lynx, nc, safari, scp, ssh, telnet, w3m, wget, xh
+
+**System administration:** doas, su, sudo
+
+**Package managers (Linux):** apk, apt, apt-cache, apt-get, dnf, dpkg, emerge, home-manager, makepkg, opkg, pacman, paru, pkg, pkg_add, pkg_delete, portage, rpm, yay, yum, zypper
+
+**System modification:** at, batch, chkconfig, crontab, fdisk, mkfs, mount, parted, service, systemctl, umount
+
+**Network configuration:** firewall-cmd, ifconfig, ip, iptables, netstat, pfctl, route, ufw
+
+**Argument-level blocks removed:** brew install, cargo install, gem install, go install, npm install --global/-g, pip/pip3 install --user, pnpm add --global/-g, yarn global add, go test -exec
+
 ## Installation
 
 Use a package manager:
